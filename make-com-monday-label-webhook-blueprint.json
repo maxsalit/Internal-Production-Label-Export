@@ -1,0 +1,52 @@
+{
+  "name": "Monday.com Label Export – receive webhook and forward to app",
+  "flow": [
+    {
+      "id": 1,
+      "module": "webhook:CustomWebhook",
+      "version": 1,
+      "parameters": {
+        "hook": "custom",
+        "maxResults": 1
+      },
+      "mapper": {},
+      "metadata": {
+        "designer": {
+          "x": 0,
+          "y": 0
+        }
+      }
+    },
+    {
+      "id": 2,
+      "module": "http:ActionSendRequest",
+      "version": 3,
+      "parameters": {
+        "url": "https://YOUR_APP_URL/webhook/monday",
+        "method": "post",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "bodyType": "raw",
+        "parseResponse": false
+      },
+      "mapper": {
+        "body": "{{1.body}}"
+      },
+      "metadata": {
+        "designer": {
+          "x": 300,
+          "y": 0
+        }
+      }
+    }
+  ],
+  "metadata": {
+    "scenario": {
+      "label": "Monday Label Export"
+    }
+  }
+}
