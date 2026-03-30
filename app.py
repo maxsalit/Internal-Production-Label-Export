@@ -318,33 +318,47 @@ def group_line_items(line_items):
 
 
 # ---------------------------------------------------------------------------
-# Label PDF generation
+# Label PDF generation — OL5350 format (3 columns x 7 rows = 21 per page)
+# ---------------------------------------------------------------------------
+# OL5350 physical dimensions on US Letter (8.5" x 11"):
+#   Label size:    2.625" wide  x  ~1.417" tall
+#   Left margin:   0.1875"  (13.5 pt)
+#   Top margin:    0.5"     (36 pt)
+#   Column gap:    0.125"   (9 pt)
+#   Row gap:       0        (labels are flush vertically)
 # ---------------------------------------------------------------------------
 
-PAGE_WIDTH, PAGE_HEIGHT = letter   # 612 x 792 pt
-H_MARGIN = 0.25 * inch
-V_MARGIN = 0.25 * inch
-LABELS_PER_ROW = 2
-LABEL_W = (PAGE_WIDTH - 2 * H_MARGIN) / LABELS_PER_ROW   # ~288 pt = 4 in
-LABEL_H = 2.25 * inch
-LABEL_PAD = 0.15 * inch
+from reportlab.lib.utils import simpleSplit
 
-_ROWS_PER_PAGE = int((PAGE_HEIGHT - 2 * V_MARGIN) / LABEL_H)
-LABELS_PER_PAGE = LABELS_PER_ROW * _ROWS_PER_PAGE
+PAGE_WIDTH, PAGE_HEIGHT = letter          # 612 x 792 pt
+LABELS_PER_ROW = 3
+ROWS_PER_PAGE  = 7
+LABELS_PER_PAGE = LABELS_PER_ROW * ROWS_PER_PAGE   # 21
+
+H_LEFT_MARGIN = 0.1875 * inch            # 13.5 pt
+COL_GAP       = 0.125  * inch            # 9 pt
+V_TOP_MARGIN  = 0.5    * inch            # 36 pt
+
+LABEL_W = (PAGE_WIDTH - 2 * H_LEFT_MARGIN - (LABELS_PER_ROW - 1) * COL_GAP) / LABELS_PER_ROW
+# = (612 - 27 - 18) / 3 = 189 pt = 2.625"
+LABEL_H = (PAGE_HEIGHT - 2 * V_TOP_MARGIN) / ROWS_PER_PAGE
+# = (792 - 72) / 7 ≈ 102.86 pt ≈ 1.428"
+
+LABEL_PAD = 5   # pt — internal padding on all sides
 
 
 def _label_origin(idx_on_page):
-    """Return (x, y) bottom-left corner for a label position on the current page."""
+    """Return (x, y) bottom-left corner for label at position idx_on_page."""
     col = idx_on_page % LABELS_PER_ROW
     row = idx_on_page // LABELS_PER_ROW
-    x = H_MARGIN + col * LABEL_W
-    y = PAGE_HEIGHT - V_MARGIN - (row + 1) * LABEL_H
+    x = H_LEFT_MARGIN + col * (LABEL_W + COL_GAP)
+    y = PAGE_HEIGHT - V_TOP_MARGIN - (row + 1) * LABEL_H
     return x, y
 
 
 def build_labels_pdf(customer_name, po_number, grouped_items, out_path):
     """
-    Generate a PDF with one label per carton, 2 labels per row.
+    Generate a PDF with one label per carton, 3 labels per row (OL5350).
     Returns the total number of labels generated.
     """
     c = canvas.Canvas(str(out_path), pagesize=letter)
@@ -372,35 +386,53 @@ def build_labels_pdf(customer_name, po_number, grouped_items, out_path):
 
 
 def _draw_label(c, x, y, customer_name, po_number, description, box_num, total_boxes, qty):
-    """Draw a single shipping label inside its bounding box."""
+    """Draw a single shipping label clipped to its bounding box."""
     pad = LABEL_PAD
+    text_w = LABEL_W - 2 * pad      # max width available for text
 
-    # Border
+    # --- Border ---
     c.setStrokeColorRGB(0, 0, 0)
-    c.setLineWidth(1.5)
+    c.setLineWidth(0.5)
     c.rect(x, y, LABEL_W, LABEL_H)
 
-    # --- Content layout (from top down) ---
-    content_top = y + LABEL_H - pad
+    # --- Clip content to label area so nothing bleeds into adjacent labels ---
+    c.saveState()
+    clip = c.beginPath()
+    clip.rect(x + 0.5, y + 0.5, LABEL_W - 1, LABEL_H - 1)
+    c.clipPath(clip, stroke=0, fill=0)
+    c.setFillColorRGB(0, 0, 0)
+
+    # --- Layout top-down ---
+    NAME_SIZE = 10
+    DESC_SIZE = 8
+    PO_SIZE   = 8
+    BOX_SIZE  = 9
+
+    cursor = y + LABEL_H - pad  # start just below top edge
 
     # Customer name
-    c.setFont("Helvetica-Bold", 16)
-    c.setFillColorRGB(0, 0, 0)
-    c.drawString(x + pad, content_top - 14, customer_name)
+    c.setFont("Helvetica-Bold", NAME_SIZE)
+    c.drawString(x + pad, cursor - NAME_SIZE, customer_name)
+    cursor -= NAME_SIZE + 3
 
-    # Item description
-    c.setFont("Helvetica", 13)
-    c.drawString(x + pad, content_top - 14 - 20, description)
+    # Description — wrap to 2 lines max if too long
+    c.setFont("Helvetica", DESC_SIZE)
+    desc_lines = simpleSplit(description, "Helvetica", DESC_SIZE, text_w)[:2]
+    for line in desc_lines:
+        c.drawString(x + pad, cursor - DESC_SIZE, line)
+        cursor -= DESC_SIZE + 2
 
     # PO#
-    c.setFont("Helvetica", 11)
-    c.drawString(x + pad, content_top - 14 - 20 - 18, f"PO# {po_number}")
+    c.setFont("Helvetica", PO_SIZE)
+    c.drawString(x + pad, cursor - PO_SIZE, f"PO# {po_number}")
 
-    # BOX and QTY — bottom of label
-    bottom_y = y + pad + 2
-    c.setFont("Helvetica-Bold", 13)
+    # --- BOX / QTY — fixed position from bottom, raised to avoid cut-off ---
+    bottom_y = y + pad + 4
+    c.setFont("Helvetica-Bold", BOX_SIZE)
     c.drawString(x + pad, bottom_y, f"BOX: {box_num}/{total_boxes}")
     c.drawRightString(x + LABEL_W - pad, bottom_y, f"QTY: {qty:,}")
+
+    c.restoreState()
 
 
 # ---------------------------------------------------------------------------
