@@ -335,11 +335,11 @@ LABELS_PER_ROW  = 3
 ROWS_PER_PAGE   = 7
 LABELS_PER_PAGE = LABELS_PER_ROW * ROWS_PER_PAGE   # 21
 
-LABEL_W = 2.83 * inch                    # 203.76 pt
-LABEL_H = 1.5  * inch                    # 108 pt
+H_LEFT_MARGIN = 0.125 * inch             # 9 pt — left & right page margin
+V_TOP_MARGIN  = (PAGE_HEIGHT - ROWS_PER_PAGE * 1.5 * inch) / 2  # = 18 pt
 
-H_LEFT_MARGIN = (PAGE_WIDTH  - LABELS_PER_ROW * LABEL_W) / 2   # ≈ 0.36 pt
-V_TOP_MARGIN  = (PAGE_HEIGHT - ROWS_PER_PAGE  * LABEL_H) / 2   # = 18 pt
+LABEL_W = (PAGE_WIDTH - 2 * H_LEFT_MARGIN) / LABELS_PER_ROW    # 2.75" = 198 pt
+LABEL_H = 1.5 * inch                    # 108 pt
 
 LABEL_PAD = 5   # pt — internal padding on all sides
 
