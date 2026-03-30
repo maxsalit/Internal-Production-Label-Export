@@ -335,10 +335,11 @@ LABELS_PER_ROW  = 3
 ROWS_PER_PAGE   = 7
 LABELS_PER_PAGE = LABELS_PER_ROW * ROWS_PER_PAGE   # 21
 
-H_LEFT_MARGIN = 0.125 * inch             # 9 pt — left & right page margin
+H_LEFT_MARGIN = 0.125 * inch             # 9 pt  — left & right page margin
+COL_GAP       = 0.0625 * inch           # 4.5 pt — gap between columns
 V_TOP_MARGIN  = (PAGE_HEIGHT - ROWS_PER_PAGE * 1.5 * inch) / 2  # = 18 pt
 
-LABEL_W = (PAGE_WIDTH - 2 * H_LEFT_MARGIN) / LABELS_PER_ROW    # 2.75" = 198 pt
+LABEL_W = (PAGE_WIDTH - 2 * H_LEFT_MARGIN - (LABELS_PER_ROW - 1) * COL_GAP) / LABELS_PER_ROW
 LABEL_H = 1.5 * inch                    # 108 pt
 
 LABEL_PAD = 5   # pt — internal padding on all sides
@@ -348,7 +349,7 @@ def _label_origin(idx_on_page):
     """Return (x, y) bottom-left corner for label at position idx_on_page."""
     col = idx_on_page % LABELS_PER_ROW
     row = idx_on_page // LABELS_PER_ROW
-    x = H_LEFT_MARGIN + col * LABEL_W
+    x = H_LEFT_MARGIN + col * (LABEL_W + COL_GAP)
     y = PAGE_HEIGHT - V_TOP_MARGIN - (row + 1) * LABEL_H
     return x, y
 
