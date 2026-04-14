@@ -625,9 +625,10 @@ def parse_job_ticket(pdf_path):
     """
     Parse a Full Scale job ticket PDF (fillable AcroForm).
 
-    The job ticket is a PDF form — data lives in named form fields, not
-    in the page text stream. Field names follow the pattern:
-        CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
+    Handles two known field naming conventions:
+      - Smokiez format: CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
+      - DANK format:    7 - CUSTOMER, 18 - INVOICE#, QTY TO PRINTRow1..20 (+ Row1_2..Row10_2),
+                        ITEM Row1..20 (+ Row1_2..Row10_2)
 
     Returns:
         {
@@ -651,24 +652,48 @@ def parse_job_ticket(pdf_path):
         v = f.get("/V", "")
         return str(v).strip() if v and v != "/Off" else ""
 
-    client_name = field_val("CUSTOMER") or "(No Client Name)"
-    po_number = field_val("CUSTOMER PO") or "(No PO#)"
+    def first_nonempty(*names):
+        for name in names:
+            v = field_val(name)
+            if v:
+                return v
+        return ""
+
+    # --- Client name: try both conventions ---
+    client_name = first_nonempty("CUSTOMER", "7 - CUSTOMER") or "(No Client Name)"
+
+    # --- PO number: try named field, then scan for any PO/INVOICE field ---
+    po_number = first_nonempty("CUSTOMER PO", "CUSTOMER PO#")
+    if not po_number:
+        for k in sorted(fields.keys()):
+            ku = k.upper()
+            if ("PO" in ku or "INVOICE" in ku) and "PRINT" not in ku:
+                v = field_val(k)
+                if v:
+                    po_number = v
+                    break
+    po_number = po_number or "(No PO#)"
+
+    # --- SKU rows: scan both naming conventions and extended row sets ---
+    # Row IDs: Row1–Row20 (primary) + Row1_2–Row10_2 (secondary, DANK format)
+    row_ids = [str(n) for n in range(1, 21)] + [f"{n}_2" for n in range(1, 11)]
 
     skus = []
-    for n in range(1, 16):  # rows 1–15 correspond to table rows A–O
-        qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{n}"))
-        notes = field_val(f"NOTESRow{n}")
-        if qty_str.isdigit() and int(qty_str) > 0 and notes:
+    for row_id in row_ids:
+        qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{row_id}"))
+        # DANK uses "ITEM Row*", Smokiez uses "NOTESRow*"
+        description = first_nonempty(f"ITEM Row{row_id}", f"NOTESRow{row_id}")
+        if qty_str.isdigit() and int(qty_str) > 0 and description:
             num_labels = math.ceil(int(qty_str) / 400)
-            skus.append({"description": notes, "num_labels": num_labels})
+            skus.append({"description": description, "num_labels": num_labels})
 
     log.info(
         f"Parsed job ticket: client='{client_name}', PO='{po_number}', "
         f"{len(skus)} SKUs"
     )
     return {
-        "client_name": client_name or "(No Client Name)",
-        "po_number": po_number or "(No PO#)",
+        "client_name": client_name,
+        "po_number": po_number,
         "skus": skus,
     }
 

@@ -1,12 +1,16 @@
 """
-Vercel serverless handler for Monday.com label webhook.
-URL: /api/webhook_monday (must be in api/ root for Vercel to run it)
+Vercel serverless handler for Monday.com packing slip → shipping labels webhook.
+URL: /api/webhook_monday
+
+Triggered when a Packing Slip PDF is uploaded to the Packing Slip column.
+Parses the PDF, generates per-carton shipping labels, and uploads a merged
+3×7-grid PDF to the Shipping Labels column.
 """
 import json
 import sys
 from pathlib import Path
 
-# Project root (api/webhook_monday.py -> root = 2 levels up)
+# Project root (api/webhook_monday.py -> root = parent directory)
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
@@ -32,7 +36,6 @@ def _send_json(handler, status: int, data: dict):
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Monday connection test or ?challenge=xxx verification
         if "?" in self.path:
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
@@ -43,8 +46,10 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(challenge.encode("utf-8"))
                 return
-        # Return 200 so Monday "communicate with URL" check passes
-        _send_json(self, 200, {"status": "ok", "message": "Webhook ready. POST with boardId and pulseId."})
+        _send_json(self, 200, {
+            "status": "ok",
+            "message": "Shipping label webhook ready. POST with boardId and pulseId.",
+        })
 
     def do_POST(self):
         try:
@@ -54,63 +59,31 @@ class handler(BaseHTTPRequestHandler):
             _send_json(self, 400, {"error": "Invalid JSON body"})
             return
 
-        # Monday sends POST with {"challenge": "..."} to verify URL - return it exactly
+        # Monday.com URL verification challenge
         if body.get("challenge") is not None:
             _send_json(self, 200, {"challenge": body["challenge"]})
             return
 
-        # Run webhook logic
         from app import (
-            parse_webhook_payload,
-            fetch_item,
-            extract_label_data,
-            build_label_pdf,
-            ensure_output_dir,
-            safe_filename,
-            get_env_token,
-            upload_label_to_monday,
-            OUTPUT_DIR,
+            PACKING_SLIP_COLUMN_ID,
+            _process_packing_slip,
         )
 
         try:
-            board_id, item_id = parse_webhook_payload(body)
-        except ValueError as e:
-            _send_json(self, 400, {"error": str(e)})
-            return
+            event = body.get("event", body)
+            item_id = event.get("pulseId") or event.get("itemId") or event.get("item_id")
+            column_id = event.get("columnId") or event.get("column_id")
 
-        try:
-            item = fetch_item(board_id, item_id)
-        except ValueError as e:
-            _send_json(self, 404, {"error": str(e)})
-            return
-        except Exception as e:
-            _send_json(self, 502, {"error": str(e)})
-            return
+            if not item_id:
+                _send_json(self, 200, {"status": "ignored", "reason": "no item_id"})
+                return
 
-        label_data = extract_label_data(item)
-        ensure_output_dir()
-        safe_name = safe_filename(f"{label_data['client_name']}_{label_data['po_number']}_{item_id}")
-        out_path = OUTPUT_DIR / f"{safe_name}.pdf"
-        build_label_pdf(
-            label_data["client_name"],
-            label_data["item_description"],
-            label_data["po_number"],
-            out_path,
-        )
-        try:
-            token = get_env_token()
-            upload_label_to_monday(item_id, out_path, token)
-        except Exception as e:
-            _send_json(self, 502, {
-                "ok": False,
-                "message": "Label created but upload to Monday failed",
-                "error": str(e),
-                "file": out_path.name,
-            })
-            return
+            if column_id and column_id != PACKING_SLIP_COLUMN_ID:
+                _send_json(self, 200, {"status": "ignored", "reason": "wrong column"})
+                return
 
-        _send_json(self, 200, {
-            "ok": True,
-            "message": "Label created and uploaded to Monday",
-            "file": out_path.name,
-        })
+            _process_packing_slip(int(item_id))
+            _send_json(self, 200, {"status": "ok"})
+
+        except Exception as exc:
+            _send_json(self, 200, {"status": "error", "message": str(exc)})
