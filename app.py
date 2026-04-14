@@ -24,6 +24,7 @@ MONDAY_API_URL = "https://api.monday.com/v2"
 MONDAY_FILE_API_URL = "https://api.monday.com/v2/file"
 PACKING_SLIP_COLUMN_ID = "file_mkv0jhmj"
 SHIPPING_LABELS_COLUMN_ID = "file_mm0fzm60"
+JOB_STATUS_COLUMN_ID = "status__1"   # "Preparing for Shipping" trigger
 
 
 # ---------------------------------------------------------------------------
@@ -493,8 +494,9 @@ def webhook_handler():
             log.warning("No item_id in webhook payload, ignoring")
             return jsonify({"status": "ignored", "reason": "no item_id"}), 200
 
-        if column_id and column_id != PACKING_SLIP_COLUMN_ID:
-            log.info(f"Column {column_id} is not Packing Slip, ignoring")
+        allowed = {PACKING_SLIP_COLUMN_ID, JOB_STATUS_COLUMN_ID}
+        if column_id and column_id not in allowed:
+            log.info(f"Column {column_id} not a shipping-label trigger, ignoring")
             return jsonify({"status": "ignored", "reason": "wrong column"}), 200
 
         try:

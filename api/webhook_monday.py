@@ -66,6 +66,7 @@ class handler(BaseHTTPRequestHandler):
 
         from app import (
             PACKING_SLIP_COLUMN_ID,
+            JOB_STATUS_COLUMN_ID,
             _process_packing_slip,
         )
 
@@ -78,7 +79,8 @@ class handler(BaseHTTPRequestHandler):
                 _send_json(self, 200, {"status": "ignored", "reason": "no item_id"})
                 return
 
-            if column_id and column_id != PACKING_SLIP_COLUMN_ID:
+            allowed = {PACKING_SLIP_COLUMN_ID, JOB_STATUS_COLUMN_ID}
+            if column_id and column_id not in allowed:
                 _send_json(self, 200, {"status": "ignored", "reason": "wrong column"})
                 return
 
