@@ -569,3 +569,292 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     log.info(f"Starting server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
+# ---------------------------------------------------------------------------
+# Prelim Label Feature — Job Ticket Webhook
+# Triggered when a Job Ticket PDF is uploaded to the Job Ticket column.
+# Reads the PDF, generates one prelim label per 400 units per SKU, and
+# uploads a merged PDF (same 3×7 grid as shipping labels) to the Prelim
+# Label column. The packing slip / shipping label code above is unchanged.
+# ---------------------------------------------------------------------------
+
+JOB_TICKET_COLUMN_ID = "file_mksn8rw8"
+PRELIM_LABEL_COLUMN_ID = "file_mm2cy8fm"
+
+
+def get_job_ticket_url(item_id):
+    """Return the (url, name) of the most recent file in the Job Ticket column."""
+    query = """
+    query GetJobTicket($itemId: ID!) {
+      items(ids: [$itemId]) {
+        column_values(ids: ["file_mksn8rw8"]) {
+          ... on FileValue {
+            files {
+              ... on FileAssetValue {
+                asset {
+                  public_url
+                  name
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = monday_request(query, {"itemId": str(item_id)})
+    items = data.get("data", {}).get("items", [])
+    if not items:
+        raise RuntimeError(f"Item {item_id} not found")
+    col_values = items[0].get("column_values", [])
+    if not col_values:
+        raise RuntimeError("Job Ticket column not found on item")
+    files = col_values[0].get("files", [])
+    if not files:
+        raise RuntimeError("No files in Job Ticket column")
+    latest = files[-1].get("asset", {})
+    url = latest.get("public_url")
+    name = latest.get("name", "job_ticket.pdf")
+    if not url:
+        raise RuntimeError("Could not retrieve file URL from Job Ticket column")
+    return url, name
+
+
+def parse_job_ticket(pdf_path):
+    """
+    Parse a Full Scale job ticket PDF.
+
+    Returns:
+        {
+            "client_name": str,
+            "po_number": str,
+            "skus": [{"description": str, "num_labels": int}, ...]
+        }
+
+    One label is generated per 400 units (ceiling division).
+    """
+    import math
+
+    client_name = ""
+    po_number = ""
+    skus = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        if not pdf.pages:
+            raise RuntimeError("Job Ticket PDF is empty")
+        page = pdf.pages[0]
+        text = page.extract_text() or ""
+
+        # Header: CUSTOMER
+        m = re.search(r'CUSTOMER:\s*(.+?)(?:\s+SR/AM|\s*\n)', text)
+        if m:
+            client_name = m.group(1).strip()
+
+        # Header: CUSTOMER PO#
+        m = re.search(r'CUSTOMER PO#:\s*(.+?)(?:\s+DUE DATE|\s*\n)', text)
+        if m:
+            po_number = m.group(1).strip()
+
+        # Item table — column layout: [row_letter, item#, qty_to_print, notes, name, rerun_pi#]
+        # We use col[2] = QTY TO PRINT, col[3] = NOTES
+        table = page.extract_table()
+        if table:
+            for row in table:
+                if not row or len(row) < 4:
+                    continue
+                qty_cell = re.sub(r'[,\s]', '', str(row[2] or ""))
+                notes_cell = (row[3] or "").strip()
+                if qty_cell.isdigit() and int(qty_cell) > 0 and notes_cell:
+                    num_labels = math.ceil(int(qty_cell) / 400)
+                    skus.append({"description": notes_cell, "num_labels": num_labels})
+
+    log.info(
+        f"Parsed job ticket: client='{client_name}', PO='{po_number}', "
+        f"{len(skus)} SKUs"
+    )
+    return {
+        "client_name": client_name or "(No Client Name)",
+        "po_number": po_number or "(No PO#)",
+        "skus": skus,
+    }
+
+
+def _draw_prelim_label(c, x, y, client_name, po_display, description):
+    """Draw a single prelim label. Same dimensions as shipping labels; no BOX/QTY."""
+    pad = LABEL_PAD
+    text_w = LABEL_W - 2 * pad
+
+    c.saveState()
+    clip = c.beginPath()
+    clip.rect(x, y, LABEL_W, LABEL_H)
+    c.clipPath(clip, stroke=0, fill=0)
+    c.setFillColorRGB(0, 0, 0)
+
+    NAME_SIZE = 10
+    DESC_SIZE = 8
+    PO_SIZE = 8
+
+    cursor = y + LABEL_H - pad
+
+    # Client name (bold)
+    c.setFont("Helvetica-Bold", NAME_SIZE)
+    c.drawString(x + pad, cursor - NAME_SIZE, client_name)
+    cursor -= NAME_SIZE + 3
+
+    # SKU description — wrap up to 3 lines
+    c.setFont("Helvetica", DESC_SIZE)
+    desc_lines = simpleSplit(description, "Helvetica", DESC_SIZE, text_w)[:3]
+    for line in desc_lines:
+        c.drawString(x + pad, cursor - DESC_SIZE, line)
+        cursor -= DESC_SIZE + 2
+
+    # PO#
+    c.setFont("Helvetica", PO_SIZE)
+    c.drawString(x + pad, cursor - PO_SIZE, po_display)
+
+    c.restoreState()
+
+
+def build_prelim_labels_pdf(client_name, po_number, skus, out_path):
+    """
+    Generate a merged prelim labels PDF (3×7 grid, 21 per page).
+    Labels from all SKUs fill the grid continuously — no wasted space between SKUs.
+    Returns total label count.
+    """
+    po_display = f"PO# {po_number}" if not po_number.upper().startswith("PO#") else po_number
+
+    all_descriptions = []
+    for sku in skus:
+        for _ in range(sku["num_labels"]):
+            all_descriptions.append(sku["description"])
+
+    c = canvas.Canvas(str(out_path), pagesize=letter)
+
+    if not all_descriptions:
+        c.setFont("Helvetica", 10)
+        c.drawString(H_LEFT_MARGIN, PAGE_HEIGHT / 2, "No SKUs found in Job Ticket")
+        c.save()
+        return 0
+
+    for i, description in enumerate(all_descriptions):
+        if i > 0 and i % LABELS_PER_PAGE == 0:
+            c.showPage()
+        lx, ly = _label_origin(i % LABELS_PER_PAGE)
+        _draw_prelim_label(c, lx, ly, client_name, po_display, description)
+
+    c.save()
+    total = len(all_descriptions)
+    log.info(f"Generated prelim labels PDF: {total} labels → {out_path}")
+    return total
+
+
+def upload_prelim_labels_to_monday(item_id, pdf_path):
+    """Upload the prelim labels PDF to the Prelim Label column on Monday.com."""
+    token = get_token()
+    mutation = """
+    mutation AddFile($itemId: ID!, $columnId: String!, $file: File!) {
+      add_file_to_column(item_id: $itemId, column_id: $columnId, file: $file) {
+        id
+      }
+    }
+    """
+    variables = {
+        "itemId": str(item_id),
+        "columnId": PRELIM_LABEL_COLUMN_ID,
+    }
+    with open(pdf_path, "rb") as f:
+        file_bytes = f.read()
+
+    filename = Path(pdf_path).name
+    resp = requests.post(
+        MONDAY_FILE_API_URL,
+        headers={"Authorization": token, "API-Version": "2024-01"},
+        files={
+            "query": (None, mutation),
+            "variables": (None, json.dumps(variables)),
+            "map": (None, json.dumps({"file": ["variables.file"]})),
+            "file": (filename, file_bytes, "application/pdf"),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if "errors" in result:
+        raise RuntimeError(f"Upload error: {result['errors']}")
+    log.info(f"Uploaded {filename} to Prelim Label column for item {item_id}")
+    return result
+
+
+def _process_job_ticket(item_id):
+    """Download job ticket, parse it, generate prelim labels, upload to Monday."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_in = Path(tmp) / "job_ticket.pdf"
+        pdf_out = Path(tmp) / f"prelim_labels_{item_id}.pdf"
+
+        log.info(f"Fetching job ticket file URL for item {item_id}")
+        url, filename = get_job_ticket_url(item_id)
+        log.info(f"Downloading: {filename}")
+        download_file(url, pdf_in)
+
+        log.info("Parsing job ticket")
+        parsed = parse_job_ticket(pdf_in)
+
+        if not parsed["skus"]:
+            raise RuntimeError("No SKUs found in job ticket — check PDF format")
+
+        total_labels = sum(sku["num_labels"] for sku in parsed["skus"])
+        log.info(
+            f"Generating {total_labels} prelim labels for "
+            f"'{parsed['client_name']}' PO# {parsed['po_number']}"
+        )
+        build_prelim_labels_pdf(
+            parsed["client_name"], parsed["po_number"], parsed["skus"], pdf_out
+        )
+
+        log.info("Uploading prelim labels to Monday.com")
+        upload_prelim_labels_to_monday(item_id, pdf_out)
+
+
+@app.route("/webhook/job-ticket", methods=["GET"])
+def job_ticket_webhook_verify():
+    """Monday.com webhook URL verification for job ticket endpoint."""
+    challenge = request.args.get("challenge")
+    if challenge:
+        return jsonify({"challenge": challenge})
+    return "OK", 200
+
+
+@app.route("/webhook/job-ticket", methods=["POST"])
+def job_ticket_webhook_handler():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+
+        if "challenge" in body:
+            return jsonify({"challenge": body["challenge"]})
+
+        event = body.get("event", body)
+        item_id = event.get("pulseId") or event.get("itemId") or event.get("item_id")
+        column_id = event.get("columnId") or event.get("column_id")
+
+        log.info(f"Job ticket webhook — item={item_id}, column={column_id}")
+
+        if not item_id:
+            log.warning("No item_id in webhook payload, ignoring")
+            return jsonify({"status": "ignored", "reason": "no item_id"}), 200
+
+        if column_id and column_id != JOB_TICKET_COLUMN_ID:
+            log.info(f"Column {column_id} is not Job Ticket, ignoring")
+            return jsonify({"status": "ignored", "reason": "wrong column"}), 200
+
+        try:
+            _process_job_ticket(item_id)
+        except Exception as exc:
+            log.exception(f"Processing error for item {item_id}: {exc}")
+            return jsonify({"status": "error", "message": str(exc)}), 200
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as exc:
+        log.exception(f"Unexpected webhook error: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 200
