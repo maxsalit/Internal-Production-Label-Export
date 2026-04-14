@@ -623,7 +623,11 @@ def get_job_ticket_url(item_id):
 
 def parse_job_ticket(pdf_path):
     """
-    Parse a Full Scale job ticket PDF.
+    Parse a Full Scale job ticket PDF (fillable AcroForm).
+
+    The job ticket is a PDF form — data lives in named form fields, not
+    in the page text stream. Field names follow the pattern:
+        CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
 
     Returns:
         {
@@ -635,39 +639,28 @@ def parse_job_ticket(pdf_path):
     One label is generated per 400 units (ceiling division).
     """
     import math
+    from pypdf import PdfReader
 
-    client_name = ""
-    po_number = ""
+    reader = PdfReader(str(pdf_path))
+    fields = reader.get_fields() or {}
+
+    def field_val(name):
+        f = fields.get(name)
+        if f is None:
+            return ""
+        v = f.get("/V", "")
+        return str(v).strip() if v and v != "/Off" else ""
+
+    client_name = field_val("CUSTOMER") or "(No Client Name)"
+    po_number = field_val("CUSTOMER PO") or "(No PO#)"
+
     skus = []
-
-    with pdfplumber.open(pdf_path) as pdf:
-        if not pdf.pages:
-            raise RuntimeError("Job Ticket PDF is empty")
-        page = pdf.pages[0]
-        text = page.extract_text() or ""
-
-        # Header: CUSTOMER
-        m = re.search(r'CUSTOMER:\s*(.+?)(?:\s+SR/AM|\s*\n)', text)
-        if m:
-            client_name = m.group(1).strip()
-
-        # Header: CUSTOMER PO#
-        m = re.search(r'CUSTOMER PO#:\s*(.+?)(?:\s+DUE DATE|\s*\n)', text)
-        if m:
-            po_number = m.group(1).strip()
-
-        # Item table — column layout: [row_letter, item#, qty_to_print, notes, name, rerun_pi#]
-        # We use col[2] = QTY TO PRINT, col[3] = NOTES
-        table = page.extract_table()
-        if table:
-            for row in table:
-                if not row or len(row) < 4:
-                    continue
-                qty_cell = re.sub(r'[,\s]', '', str(row[2] or ""))
-                notes_cell = (row[3] or "").strip()
-                if qty_cell.isdigit() and int(qty_cell) > 0 and notes_cell:
-                    num_labels = math.ceil(int(qty_cell) / 400)
-                    skus.append({"description": notes_cell, "num_labels": num_labels})
+    for n in range(1, 16):  # rows 1–15 correspond to table rows A–O
+        qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{n}"))
+        notes = field_val(f"NOTESRow{n}")
+        if qty_str.isdigit() and int(qty_str) > 0 and notes:
+            num_labels = math.ceil(int(qty_str) / 400)
+            skus.append({"description": notes, "num_labels": num_labels})
 
     log.info(
         f"Parsed job ticket: client='{client_name}', PO='{po_number}', "
