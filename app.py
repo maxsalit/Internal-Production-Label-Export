@@ -1583,6 +1583,33 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
 
         log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 fields set")
 
+    # pypdf regenerates /AP (appearance streams) with its own fixed font size,
+    # ignoring the template's 0 Tf (Auto) setting in /DA.  Fix: delete /AP from
+    # every annotation on every page so the PDF viewer regenerates from /DA.
+    # Set /NeedAppearances so viewers know to do this.
+    _ap = NameObject("/AP")
+    for page in writer.pages:
+        annots_ref = page.get("/Annots")
+        if not annots_ref:
+            continue
+        annots = annots_ref.get_object() if hasattr(annots_ref, "get_object") else annots_ref
+        for ref in annots:
+            try:
+                annot = ref.get_object()
+                if _ap in annot:
+                    del annot[_ap]
+            except Exception:
+                pass
+
+    try:
+        from pypdf.generic import BooleanObject
+        acroform = writer._root_object.get("/AcroForm")
+        if acroform is not None:
+            acroform_obj = acroform.get_object() if hasattr(acroform, "get_object") else acroform
+            acroform_obj[NameObject("/NeedAppearances")] = BooleanObject(True)
+    except Exception as e:
+        log.warning(f"[fill-nonpouch-jt] could not set /NeedAppearances: {e}")
+
     with open(str(out_path), "wb") as f:
         writer.write(f)
 
