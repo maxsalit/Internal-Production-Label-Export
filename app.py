@@ -1563,6 +1563,10 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
             row_field_values[f"P{p}_R{rr}_SIZE{sfx}"] = size
             row_field_values[f"P{p}_R{rr}_MC{sfx}"] = mc
 
+        # Set a fixed /DA on overflow annotations so the viewer renders them at
+        # a consistent 8pt rather than using the inherited Auto (0 Tf) which
+        # makes short values like "750" fill the entire row height.
+        _da_fixed = create_string_object("/Helv 8 Tf 0 g")
         for page in writer.pages:
             annots_ref = page.get("/Annots")
             if not annots_ref:
@@ -1578,28 +1582,11 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
                     continue
                 val = row_field_values[field_name]
                 annot[NameObject("/V")] = create_string_object(val)
+                annot[NameObject("/DA")] = _da_fixed
                 if NameObject("/AP") in annot:
                     del annot[NameObject("/AP")]
 
         log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 fields set")
-
-    # pypdf regenerates /AP (appearance streams) with its own fixed font size,
-    # ignoring the template's 0 Tf (Auto) setting in /DA.  Fix: delete /AP from
-    # every annotation on every page so the PDF viewer regenerates from /DA.
-    # Set /NeedAppearances so viewers know to do this.
-    _ap = NameObject("/AP")
-    for page in writer.pages:
-        annots_ref = page.get("/Annots")
-        if not annots_ref:
-            continue
-        annots = annots_ref.get_object() if hasattr(annots_ref, "get_object") else annots_ref
-        for ref in annots:
-            try:
-                annot = ref.get_object()
-                if _ap in annot:
-                    del annot[_ap]
-            except Exception:
-                pass
 
     try:
         from pypdf.generic import BooleanObject
