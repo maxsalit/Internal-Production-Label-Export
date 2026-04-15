@@ -1566,7 +1566,11 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
         # Set a fixed /DA on overflow annotations so the viewer renders them at
         # a consistent 8pt rather than using the inherited Auto (0 Tf) which
         # makes short values like "750" fill the entire row height.
+        # Also set Ff=4096 (multiline) on ITEM fields so long names wrap instead
+        # of being clipped (page-1 fields already have Ff=4096 in the template).
+        from pypdf.generic import NumberObject
         _da_fixed = create_string_object("/Helv 8 Tf 0 g")
+        _ff_multiline = NumberObject(4096)
         for page in writer.pages:
             annots_ref = page.get("/Annots")
             if not annots_ref:
@@ -1583,6 +1587,9 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
                 val = row_field_values[field_name]
                 annot[NameObject("/V")] = create_string_object(val)
                 annot[NameObject("/DA")] = _da_fixed
+                # ITEM fields: enable multiline so long names wrap
+                if "_ITEM" in field_name:
+                    annot[NameObject("/Ff")] = _ff_multiline
                 if NameObject("/AP") in annot:
                     del annot[NameObject("/AP")]
 
