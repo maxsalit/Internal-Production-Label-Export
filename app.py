@@ -104,10 +104,9 @@ def download_file(url, dest_path, auth_token: str | None = None):
     if auth_token:
         headers["Authorization"] = auth_token
     elif "protected_static" in url or "monday.com" in url:
-        # Monday's static file CDN requires Bearer prefix (unlike the GraphQL endpoint)
+        # Monday protected_static URLs require the API token
         try:
-            token = get_token()
-            headers["Authorization"] = f"Bearer {token}"
+            headers["Authorization"] = get_token()
         except Exception:
             pass
     resp = requests.get(url, headers=headers, timeout=60)
@@ -1192,6 +1191,11 @@ def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
     Search the Pricing board for an item whose PI# column matches pi_number.
     Returns (url, filename, customer_name) of the most recent invoice file attached.
     customer_name comes from the "Client" dropdown column on the Pricing board.
+
+    File download strategy: Monday's protected_static CDN URLs cannot be downloaded
+    with an API token. Instead we get the assetId from the file column value JSON,
+    then call assets(ids: [assetId]) { public_url } which returns a pre-signed S3 URL
+    valid for 1 hour — no auth header needed to download.
     """
     query = """
     query FindInvoice($boardId: ID!, $columnId: String!, $value: String!) {
@@ -1233,19 +1237,42 @@ def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
 
     customer_name = (client_cv.get("text") or "").strip()
 
-    # The column's text field contains the protected_static download URL directly
-    url = (invoice_cv.get("text") or "").strip()
-    if not url:
-        raise RuntimeError(f"No invoice file attached for PI# '{pi_number}'")
-
-    # Extract filename from value JSON if available
+    # Parse assetId from the file column value JSON
     raw_value = invoice_cv.get("value") or "{}"
     try:
         file_data = json.loads(raw_value)
-        name = (file_data.get("files") or [{}])[-1].get("name", "invoice.pdf")
+        latest_file = (file_data.get("files") or [{}])[-1]
+        asset_id = latest_file.get("assetId") or latest_file.get("id")
+        name = latest_file.get("name", "invoice.pdf")
     except Exception:
+        asset_id = None
         name = "invoice.pdf"
 
+    if not asset_id:
+        raise RuntimeError(f"No invoice file attached for PI# '{pi_number}'")
+
+    # Query the assets API for a pre-signed public_url (downloadable without auth)
+    assets_query = """
+    query GetAsset($ids: [ID!]!) {
+      assets(ids: $ids) { id name public_url url }
+    }
+    """
+    assets_data = monday_request(assets_query, {"ids": [str(asset_id)]})
+    assets = assets_data.get("data", {}).get("assets", [])
+    if not assets:
+        raise RuntimeError(f"Asset {asset_id} not found for PI# '{pi_number}'")
+
+    asset = assets[0]
+    name = asset.get("name") or name
+    # Prefer public_url (pre-signed S3, no auth needed); fall back to url
+    url = asset.get("public_url") or asset.get("url") or ""
+    if not url:
+        raise RuntimeError(
+            f"No downloadable URL for invoice asset {asset_id} (PI# '{pi_number}'). "
+            "public_url and url are both empty."
+        )
+
+    log.info(f"[find-invoice] PI#{pi_number} → asset {asset_id} '{name}' url_type={'public' if asset.get('public_url') else 'protected'}")
     return url, name, customer_name
 
 
