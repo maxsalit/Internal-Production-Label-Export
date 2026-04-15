@@ -68,6 +68,7 @@ class handler(BaseHTTPRequestHandler):
         from app import (
             PROOF_STATUS_COLUMN_ID,
             _process_proof_approved,
+            _post_monday_error_update,
         )
 
         try:
@@ -87,4 +88,15 @@ class handler(BaseHTTPRequestHandler):
             _send_json(self, 200, {"status": "ok"})
 
         except Exception as exc:
+            import logging, traceback
+            tb = traceback.format_exc()
+            logging.getLogger(__name__).error(
+                f"[webhook_proof_approved] item={item_id} error: {exc}\n{tb}"
+            )
+            # Post the error directly to the Monday item so it's visible without Vercel logs
+            if item_id:
+                try:
+                    _post_monday_error_update(int(item_id), f"{exc}\n\n{tb}")
+                except Exception:
+                    pass
             _send_json(self, 200, {"status": "error", "message": str(exc)})

@@ -1166,6 +1166,22 @@ def _get_item_data_for_jt(item_id: int) -> dict:
     }
 
 
+def _post_monday_error_update(item_id: int, error_msg: str) -> None:
+    """Post an error message as a Monday.com update on the item so it's visible without Vercel logs."""
+    try:
+        mutation = """
+        mutation PostUpdate($itemId: ID!, $body: String!) {
+          create_update(item_id: $itemId, body: $body) { id }
+        }
+        """
+        monday_request(mutation, {
+            "itemId": str(item_id),
+            "body": f"⚠️ Proof Approved automation error:\n\n{error_msg}",
+        })
+    except Exception as e:
+        log.warning(f"[proof-approved] could not post error update to Monday: {e}")
+
+
 def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
     """
     Search the Pricing board for an item whose PI# column matches pi_number.
