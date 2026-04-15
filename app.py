@@ -625,12 +625,11 @@ def parse_job_ticket(pdf_path):
     """
     Parse a Full Scale job ticket PDF (fillable AcroForm).
 
-    Handles three known field naming conventions:
-      - Smokiez format:  CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
-      - DANK format:     7 - CUSTOMER, 18 - INVOICE#, QTY TO PRINTRow1..20
-                         (+ Row1_2..Row10_2), ITEM Row1..20
-      - Pouch JT format: CUSTOMER, CUSTOMER PO, QTY TO PRINT{A-Z,AA-RR},
-                         DETAIL  SKU{A-O} (double space) / DETAIL SKU{P+} (single space)
+    Handles four known field naming conventions:
+      - Pouch JT:          has "POUCH TYPE" field; QTY TO PRINT{A-RR}, DETAIL  SKU{A-O} / DETAIL SKU{P+}
+      - Non-Pouch JT:      has "QTY TO PRINTA" but no "POUCH TYPE"; Item # in single-letter field (A-N)
+      - Old Smokiez/DANK:  has "QTY TO PRINTRow1"; description in "NOTESRow1" or "ITEM Row1"
+      - WCC-style numbered: has "07 Text Field 4"; rows at Text Field 14/15, 19/20, … (+5 per row)
 
     Format is auto-detected from which fields are present.
     Returns:
@@ -662,25 +661,49 @@ def parse_job_ticket(pdf_path):
                 return v
         return ""
 
-    # --- Client name ---
-    client_name = first_nonempty("CUSTOMER", "7 - CUSTOMER") or "(No Client Name)"
+    def parse_qty(raw):
+        """Parse qty strings like '6000', '6,000', '10K', '10.5K' → int."""
+        s = raw.strip().upper().replace(',', '').replace(' ', '')
+        if not s:
+            return 0
+        if s.endswith('K'):
+            try:
+                return int(float(s[:-1]) * 1000)
+            except ValueError:
+                return 0
+        try:
+            return int(float(s))
+        except ValueError:
+            return 0
 
-    # --- PO number ---
-    po_number = first_nonempty("CUSTOMER PO", "CUSTOMER PO#")
-    if not po_number:
-        for k in sorted(fields.keys()):
-            ku = k.upper()
-            if ("PO" in ku or "INVOICE" in ku) and "PRINT" not in ku and "DETAIL" not in ku:
-                v = field_val(k)
-                if v:
-                    po_number = v
-                    break
-    po_number = po_number or "(No PO#)"
+    # --- Detect format by template-unique fields ---
+    is_pouch_format    = "POUCH TYPE" in fields          # Pouch JT template
+    has_numbered_fields = "07 Text Field 4" in fields    # WCC-style generic-numbered template
+    has_row_numbers    = "QTY TO PRINTRow1" in fields    # Old Smokiez / DANK
+    has_letter_rows    = "QTY TO PRINTA" in fields       # New Non-Pouch JT (letter rows, no POUCH TYPE)
+
+    # --- Client name ---
+    if has_numbered_fields:
+        client_name = field_val("07 Text Field 4") or "(No Client Name)"
+    else:
+        client_name = first_nonempty("CUSTOMER", "7 - CUSTOMER") or "(No Client Name)"
+
+    # --- PO / Invoice number ---
+    if has_numbered_fields:
+        po_number = field_val("20 Text Field 10") or "(No PO#)"
+    else:
+        po_number = first_nonempty("CUSTOMER PO", "CUSTOMER PO#")
+        if not po_number:
+            for k in sorted(fields.keys()):
+                ku = k.upper()
+                if ("PO" in ku or "INVOICE" in ku) and "PRINT" not in ku and "DETAIL" not in ku:
+                    v = field_val(k)
+                    if v:
+                        po_number = v
+                        break
+        po_number = po_number or "(No PO#)"
 
     skus = []
-
-    # --- Detect format: Pouch JT uses lettered rows (QTY TO PRINTA, etc.) ---
-    is_pouch_format = any(field_val(f"QTY TO PRINT{r}") for r in list("ABCDE"))
 
     if is_pouch_format:
         # Pouch JT: rows A–O use "DETAIL  SKU{row}" (double space);
@@ -692,27 +715,58 @@ def parse_job_ticket(pdf_path):
                "KK", "LL", "MM", "NN", "OO", "PP", "QQ", "RR"]
         )
         for row in rows_ao + rows_p_plus:
-            qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINT{row}"))
+            qty = parse_qty(field_val(f"QTY TO PRINT{row}"))
             detail_key = f"DETAIL  SKU{row}" if row in rows_ao else f"DETAIL SKU{row}"
             description = field_val(detail_key)
-            if qty_str.isdigit() and int(qty_str) > 0 and description:
-                num_labels = math.ceil(int(qty_str) / 400)
-                skus.append({"description": description, "num_labels": num_labels})
-    else:
-        # Non-pouch (Smokiez / DANK): Row1–Row20 + Row1_2–Row10_2
+            if qty > 0 and description:
+                skus.append({"description": description, "num_labels": math.ceil(qty / 400)})
+    elif has_numbered_fields:
+        # WCC-style template: rows at Text Field 14, 15 / 19, 20 / 24, 25 … (+5 per row, 10 rows)
+        # [ITEM #, QTY TO PRINT, SIZE, M&C, NAME] per row
+        for row in range(10):
+            base = 14 + row * 5
+            description = field_val(f"Text Field {base}")
+            qty = parse_qty(field_val(f"Text Field {base + 1}"))
+            if qty > 0 and description:
+                skus.append({"description": description, "num_labels": math.ceil(qty / 400)})
+    elif has_letter_rows:
+        # New Non-Pouch JT: rows A–N; item name in single-letter field; row N has a space prefix
+        for L in list("ABCDEFGHIJKLM") + ["N"]:
+            sp = " " if L == "N" else ""
+            qty = parse_qty(field_val(f"QTY TO PRINT{sp}{L}"))
+            description = field_val(L)  # "Item #" column
+            if qty > 0 and description:
+                skus.append({"description": description, "num_labels": math.ceil(qty / 400)})
+    elif has_row_numbers:
+        # Old Smokiez / DANK format: numbered rows Row1–Row20 + Row1_2–Row10_2
         row_ids = [str(n) for n in range(1, 21)] + [f"{n}_2" for n in range(1, 11)]
         for row_id in row_ids:
-            qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{row_id}"))
+            qty = parse_qty(field_val(f"QTY TO PRINTRow{row_id}"))
             description = first_nonempty(f"ITEM Row{row_id}", f"NOTESRow{row_id}")
-            if qty_str.isdigit() and int(qty_str) > 0 and description:
-                num_labels = math.ceil(int(qty_str) / 400)
-                skus.append({"description": description, "num_labels": num_labels})
+            if qty > 0 and description:
+                skus.append({"description": description, "num_labels": math.ceil(qty / 400)})
 
-    fmt = "pouch" if is_pouch_format else "non-pouch"
-    log.info(
-        f"Parsed job ticket ({fmt} format): client='{client_name}', "
-        f"PO='{po_number}', {len(skus)} SKUs"
-    )
+    if is_pouch_format:
+        fmt = "pouch"
+    elif has_numbered_fields:
+        fmt = "non-pouch (numbered fields)"
+    elif has_letter_rows:
+        fmt = "non-pouch (letter rows)"
+    elif has_row_numbers:
+        fmt = "non-pouch (numbered rows)"
+    else:
+        fmt = "unknown"
+    if not skus:
+        all_field_names = sorted(fields.keys())
+        log.warning(
+            f"Parsed job ticket ({fmt} format): 0 SKUs found. "
+            f"All PDF fields ({len(all_field_names)}): {all_field_names}"
+        )
+    else:
+        log.info(
+            f"Parsed job ticket ({fmt} format): client='{client_name}', "
+            f"PO='{po_number}', {len(skus)} SKUs"
+        )
     return {
         "client_name": client_name,
         "po_number": po_number,

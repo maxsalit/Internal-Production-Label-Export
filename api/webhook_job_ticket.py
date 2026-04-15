@@ -86,4 +86,8 @@ class handler(BaseHTTPRequestHandler):
             _send_json(self, 200, {"status": "ok"})
 
         except Exception as exc:
+            import logging, traceback
+            logging.getLogger(__name__).error(
+                f"[webhook_job_ticket] item={item_id} error: {exc}\n{traceback.format_exc()}"
+            )
             _send_json(self, 200, {"status": "error", "message": str(exc)})
