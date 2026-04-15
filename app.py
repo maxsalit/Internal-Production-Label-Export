@@ -94,9 +94,18 @@ def get_packing_slip_url(item_id):
     return url, name
 
 
-def download_file(url, dest_path):
-    """Download a file using a pre-signed public URL (no auth header needed)."""
-    resp = requests.get(url, timeout=60)
+def download_file(url, dest_path, auth_token: str | None = None):
+    """Download a file, optionally with a Monday.com API token for protected_static URLs."""
+    headers = {}
+    if auth_token:
+        headers["Authorization"] = auth_token
+    elif "protected_static" in url or "monday.com" in url:
+        # Monday protected_static URLs require the API token
+        try:
+            headers["Authorization"] = get_token()
+        except Exception:
+            pass
+    resp = requests.get(url, headers=headers, timeout=60)
     resp.raise_for_status()
     with open(dest_path, "wb") as f:
         f.write(resp.content)
@@ -1176,13 +1185,7 @@ def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
           column_values(ids: ["file_mknhcwtm", "dropdown_mks82t5z"]) {
             id
             text
-            ... on FileValue {
-              files {
-                ... on FileAssetValue {
-                  asset { public_url name }
-                }
-              }
-            }
+            value
           }
         }
       }
@@ -1204,21 +1207,24 @@ def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
     item = items[0]
     col_values = item.get("column_values", [])
 
-    # Separate invoice file and client name columns
     invoice_cv = next((cv for cv in col_values if cv.get("id") == "file_mknhcwtm"), {})
     client_cv = next((cv for cv in col_values if cv.get("id") == "dropdown_mks82t5z"), {})
 
     customer_name = (client_cv.get("text") or "").strip()
 
-    files = invoice_cv.get("files", [])
-    if not files:
+    # The column's text field contains the protected_static download URL directly
+    url = (invoice_cv.get("text") or "").strip()
+    if not url:
         raise RuntimeError(f"No invoice file attached for PI# '{pi_number}'")
 
-    latest = files[-1].get("asset", {})
-    url = latest.get("public_url")
-    name = latest.get("name", "invoice.pdf")
-    if not url:
-        raise RuntimeError(f"Could not get download URL for invoice PI# '{pi_number}'")
+    # Extract filename from value JSON if available
+    raw_value = invoice_cv.get("value") or "{}"
+    try:
+        file_data = json.loads(raw_value)
+        name = (file_data.get("files") or [{}])[-1].get("name", "invoice.pdf")
+    except Exception:
+        name = "invoice.pdf"
+
     return url, name, customer_name
 
 
@@ -1653,60 +1659,91 @@ def _process_proof_approved(item_id: int) -> None:
       4b. Else if label line items found → fill Non-Pouch JT template (NoAPP or WITH_Application)
       4c. Else → skip silently
       5. Upload filled PDF(s) to Job Ticket column
+      6. Directly generate prelim labels (Monday may not fire the JT webhook for uploads)
     """
     with tempfile.TemporaryDirectory() as _tmp:
         tmp = Path(_tmp)
 
-        log.info(f"[proof-approved] fetching item data for {item_id}")
-        item_data = _get_item_data_for_jt(item_id)
+        try:
+            log.info(f"[proof-approved] step 1/6 — fetching item data for {item_id}")
+            item_data = _get_item_data_for_jt(item_id)
+        except Exception as e:
+            raise RuntimeError(f"[step 1 fetch-item] {e}") from e
 
         pi_number = item_data.get("pi_number", "").strip()
         if not pi_number:
             log.warning(f"[proof-approved] item {item_id} has no PI# — skipping")
             return
 
-        log.info(f"[proof-approved] looking up invoice for PI# {pi_number}")
-        invoice_url, invoice_name, pricing_customer = _find_invoice_on_pricing_board(pi_number)
+        try:
+            log.info(f"[proof-approved] step 2/6 — looking up invoice for PI# {pi_number}")
+            invoice_url, invoice_name, pricing_customer = _find_invoice_on_pricing_board(pi_number)
+        except Exception as e:
+            raise RuntimeError(f"[step 2 find-invoice PI#{pi_number}] {e}") from e
 
         # Mirror column may be null if board relation isn't connected; fall back to Pricing board
         if not item_data.get("customer") and pricing_customer:
             item_data["customer"] = pricing_customer
             log.info(f"[proof-approved] customer from Pricing board: '{pricing_customer}'")
 
-        invoice_path = tmp / "invoice.pdf"
-        download_file(invoice_url, invoice_path)
+        try:
+            log.info(f"[proof-approved] step 3/6 — downloading invoice from {invoice_url[:80]}…")
+            invoice_path = tmp / "invoice.pdf"
+            download_file(invoice_url, invoice_path)
+            log.info(f"[proof-approved] invoice downloaded ({invoice_path.stat().st_size} bytes)")
+        except Exception as e:
+            raise RuntimeError(f"[step 3 download-invoice] {e}") from e
 
-        log.info("[proof-approved] extracting invoice text")
-        invoice_text = _extract_invoice_text(invoice_path)
+        try:
+            log.info("[proof-approved] step 4/6 — extracting invoice text")
+            invoice_text = _extract_invoice_text(invoice_path)
+            log.info(f"[proof-approved] extracted {len(invoice_text)} chars of invoice text")
+        except Exception as e:
+            raise RuntimeError(f"[step 4 extract-text] {e}") from e
 
-        log.info("[proof-approved] calling Claude for pouch specs")
-        specs_list = _extract_pouch_specs(invoice_text)
+        try:
+            log.info("[proof-approved] step 5a/6 — calling Claude for pouch specs")
+            specs_list = _extract_pouch_specs(invoice_text)
+        except Exception as e:
+            raise RuntimeError(f"[step 5a claude-pouch] {e}") from e
 
         # Build a filesystem-safe base name: "Client Name_PI#_JT"
         _safe = re.sub(r'[\\/:*?"<>|]', "", item_data.get("customer", "Unknown"))
         _pi = item_data.get("pi_number", "").strip() or "NoPI"
         _base = f"{_safe}_{_pi}_JT"
 
+        uploaded_jt_paths = []
+
         if specs_list:
             # --- Pouch job: one JT per distinct sizing line item ---
             for i, pouch_specs in enumerate(specs_list, 1):
                 suffix = f"_{i}" if len(specs_list) > 1 else ""
                 jt_out = tmp / f"{_base}{suffix}.pdf"
-                log.info(f"[proof-approved] filling pouch JT {i}/{len(specs_list)}: {pouch_specs.get('sku', '')}")
-                _fill_pouch_jt(
-                    POUCH_JT_TEMPLATE_PATH,
-                    item_data,
-                    pouch_specs,
-                    item_data["subitems"],
-                    jt_out,
-                )
-                log.info(f"[proof-approved] uploading pouch JT {i}/{len(specs_list)}")
-                _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+                try:
+                    log.info(f"[proof-approved] step 5b/6 — filling pouch JT {i}/{len(specs_list)}: {pouch_specs.get('sku', '')}")
+                    _fill_pouch_jt(
+                        POUCH_JT_TEMPLATE_PATH,
+                        item_data,
+                        pouch_specs,
+                        item_data["subitems"],
+                        jt_out,
+                    )
+                except Exception as e:
+                    raise RuntimeError(f"[step 5b fill-pouch-jt {i}] {e}") from e
+                try:
+                    log.info(f"[proof-approved] step 6/6 — uploading pouch JT {i}/{len(specs_list)}")
+                    _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+                    uploaded_jt_paths.append(jt_out)
+                except Exception as e:
+                    raise RuntimeError(f"[step 6 upload-pouch-jt {i}] {e}") from e
             log.info(f"[proof-approved] done — {len(specs_list)} pouch JT(s) uploaded for item {item_id}")
         else:
             # --- Not a pouch job — try non-pouch label template ---
-            log.info("[proof-approved] no pouch specs found; checking for non-pouch label job")
-            nonpouch_specs = _extract_nonpouch_specs(invoice_text)
+            try:
+                log.info("[proof-approved] step 5b/6 — calling Claude for non-pouch specs")
+                nonpouch_specs = _extract_nonpouch_specs(invoice_text)
+            except Exception as e:
+                raise RuntimeError(f"[step 5b claude-nonpouch] {e}") from e
 
             if nonpouch_specs is None:
                 log.info(f"[proof-approved] item {item_id} is not a pouch or label job — skipping")
@@ -1720,16 +1757,35 @@ def _process_proof_approved(item_id: int) -> None:
             )
 
             jt_out = tmp / f"{_base}.pdf"
-            _fill_nonpouch_jt(
-                template,
-                item_data,
-                nonpouch_specs,
-                item_data["subitems"],
-                jt_out,
-            )
-            log.info("[proof-approved] uploading non-pouch JT")
-            _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+            try:
+                _fill_nonpouch_jt(
+                    template,
+                    item_data,
+                    nonpouch_specs,
+                    item_data["subitems"],
+                    jt_out,
+                )
+            except Exception as e:
+                raise RuntimeError(f"[step 5b fill-nonpouch-jt] {e}") from e
+            try:
+                log.info("[proof-approved] step 6/6 — uploading non-pouch JT")
+                _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+                uploaded_jt_paths.append(jt_out)
+            except Exception as e:
+                raise RuntimeError(f"[step 6 upload-nonpouch-jt] {e}") from e
             log.info(f"[proof-approved] done — non-pouch JT uploaded for item {item_id}")
+
+        # Monday.com does not reliably fire column-change webhooks for programmatic
+        # file uploads, so we generate prelim labels directly here rather than
+        # relying on the JT webhook to pick them up.
+        if uploaded_jt_paths:
+            log.info(f"[proof-approved] generating prelim labels directly for item {item_id}")
+            try:
+                _process_job_ticket(item_id)
+                log.info(f"[proof-approved] prelim labels generated for item {item_id}")
+            except Exception as e:
+                # Non-fatal: JT was already uploaded; log but don't fail the whole request
+                log.error(f"[proof-approved] prelim label generation failed (non-fatal): {e}")
 
 
 @app.route("/webhook/proof-approved", methods=["GET"])

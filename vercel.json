@@ -1,7 +1,10 @@
 {
   "functions": {
     "api/webhook_proof_approved.py": {
-      "maxDuration": 60
+      "maxDuration": 300
+    },
+    "api/webhook_job_ticket.py": {
+      "maxDuration": 300
     }
   }
 }
