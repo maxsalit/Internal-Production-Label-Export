@@ -95,14 +95,19 @@ def get_packing_slip_url(item_id):
 
 
 def download_file(url, dest_path, auth_token: str | None = None):
-    """Download a file, optionally with a Monday.com API token for protected_static URLs."""
+    """Download a file, optionally with a Monday.com API token for protected_static URLs.
+
+    Monday's CDN (protected_static) requires 'Authorization: Bearer {token}'.
+    The GraphQL endpoint uses the raw token without Bearer — these are different.
+    """
     headers = {}
     if auth_token:
         headers["Authorization"] = auth_token
     elif "protected_static" in url or "monday.com" in url:
-        # Monday protected_static URLs require the API token
+        # Monday's static file CDN requires Bearer prefix (unlike the GraphQL endpoint)
         try:
-            headers["Authorization"] = get_token()
+            token = get_token()
+            headers["Authorization"] = f"Bearer {token}"
         except Exception:
             pass
     resp = requests.get(url, headers=headers, timeout=60)
