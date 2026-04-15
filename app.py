@@ -1356,12 +1356,23 @@ def _extract_pouch_specs(invoice_text: str) -> list:
     )
 
     response_text = message.content[0].text.strip()
-    # Match a JSON array
-    json_match = re.search(r"\[.*\]", response_text, re.DOTALL)
-    if not json_match:
+    # Extract the first complete JSON array by counting bracket depth
+    json_str = None
+    start = response_text.find("[")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(response_text[start:], start):
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    json_str = response_text[start : i + 1]
+                    break
+    if not json_str:
         raise RuntimeError(f"Claude returned unexpected response: {response_text[:300]}")
 
-    specs_list = json.loads(json_match.group())
+    specs_list = json.loads(json_str)
     if not isinstance(specs_list, list):
         raise RuntimeError(f"Claude returned non-list JSON: {response_text[:300]}")
 
@@ -1430,13 +1441,27 @@ def _extract_nonpouch_specs(invoice_text: str) -> dict | None:
         log.info("[claude-nonpouch] invoice has no label products — skipping")
         return None
 
-    # Try to extract a JSON object from the response
-    obj_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-    if not obj_match:
+    # Extract the first complete JSON object by counting brace depth.
+    # re.search with DOTALL is greedy and matches first-{ to last-}, which
+    # breaks when Claude adds trailing text or multiple objects.
+    json_str = None
+    start = response_text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(response_text[start:], start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    json_str = response_text[start : i + 1]
+                    break
+
+    if not json_str:
         log.warning(f"[claude-nonpouch] unexpected response (no JSON object): {response_text[:300]}")
         return None
 
-    specs = json.loads(obj_match.group())
+    specs = json.loads(json_str)
     if not isinstance(specs, dict):
         log.warning("[claude-nonpouch] Claude returned non-dict JSON — skipping")
         return None
