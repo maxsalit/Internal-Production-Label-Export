@@ -625,11 +625,14 @@ def parse_job_ticket(pdf_path):
     """
     Parse a Full Scale job ticket PDF (fillable AcroForm).
 
-    Handles two known field naming conventions:
-      - Smokiez format: CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
-      - DANK format:    7 - CUSTOMER, 18 - INVOICE#, QTY TO PRINTRow1..20 (+ Row1_2..Row10_2),
-                        ITEM Row1..20 (+ Row1_2..Row10_2)
+    Handles three known field naming conventions:
+      - Smokiez format:  CUSTOMER, CUSTOMER PO, QTY TO PRINTRow1..15, NOTESRow1..15
+      - DANK format:     7 - CUSTOMER, 18 - INVOICE#, QTY TO PRINTRow1..20
+                         (+ Row1_2..Row10_2), ITEM Row1..20
+      - Pouch JT format: CUSTOMER, CUSTOMER PO, QTY TO PRINT{A-Z,AA-RR},
+                         DETAIL  SKU{A-O} (double space) / DETAIL SKU{P+} (single space)
 
+    Format is auto-detected from which fields are present.
     Returns:
         {
             "client_name": str,
@@ -659,37 +662,56 @@ def parse_job_ticket(pdf_path):
                 return v
         return ""
 
-    # --- Client name: try both conventions ---
+    # --- Client name ---
     client_name = first_nonempty("CUSTOMER", "7 - CUSTOMER") or "(No Client Name)"
 
-    # --- PO number: try named field, then scan for any PO/INVOICE field ---
+    # --- PO number ---
     po_number = first_nonempty("CUSTOMER PO", "CUSTOMER PO#")
     if not po_number:
         for k in sorted(fields.keys()):
             ku = k.upper()
-            if ("PO" in ku or "INVOICE" in ku) and "PRINT" not in ku:
+            if ("PO" in ku or "INVOICE" in ku) and "PRINT" not in ku and "DETAIL" not in ku:
                 v = field_val(k)
                 if v:
                     po_number = v
                     break
     po_number = po_number or "(No PO#)"
 
-    # --- SKU rows: scan both naming conventions and extended row sets ---
-    # Row IDs: Row1–Row20 (primary) + Row1_2–Row10_2 (secondary, DANK format)
-    row_ids = [str(n) for n in range(1, 21)] + [f"{n}_2" for n in range(1, 11)]
-
     skus = []
-    for row_id in row_ids:
-        qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{row_id}"))
-        # DANK uses "ITEM Row*", Smokiez uses "NOTESRow*"
-        description = first_nonempty(f"ITEM Row{row_id}", f"NOTESRow{row_id}")
-        if qty_str.isdigit() and int(qty_str) > 0 and description:
-            num_labels = math.ceil(int(qty_str) / 400)
-            skus.append({"description": description, "num_labels": num_labels})
 
+    # --- Detect format: Pouch JT uses lettered rows (QTY TO PRINTA, etc.) ---
+    is_pouch_format = any(field_val(f"QTY TO PRINT{r}") for r in list("ABCDE"))
+
+    if is_pouch_format:
+        # Pouch JT: rows A–O use "DETAIL  SKU{row}" (double space);
+        #           rows P–RR use "DETAIL SKU{row}" (single space)
+        rows_ao = list("ABCDEFGHIJKLMNO")
+        rows_p_plus = (
+            list("PQRSTUVWXYZ")
+            + ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ",
+               "KK", "LL", "MM", "NN", "OO", "PP", "QQ", "RR"]
+        )
+        for row in rows_ao + rows_p_plus:
+            qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINT{row}"))
+            detail_key = f"DETAIL  SKU{row}" if row in rows_ao else f"DETAIL SKU{row}"
+            description = field_val(detail_key)
+            if qty_str.isdigit() and int(qty_str) > 0 and description:
+                num_labels = math.ceil(int(qty_str) / 400)
+                skus.append({"description": description, "num_labels": num_labels})
+    else:
+        # Non-pouch (Smokiez / DANK): Row1–Row20 + Row1_2–Row10_2
+        row_ids = [str(n) for n in range(1, 21)] + [f"{n}_2" for n in range(1, 11)]
+        for row_id in row_ids:
+            qty_str = re.sub(r'[,\s]', '', field_val(f"QTY TO PRINTRow{row_id}"))
+            description = first_nonempty(f"ITEM Row{row_id}", f"NOTESRow{row_id}")
+            if qty_str.isdigit() and int(qty_str) > 0 and description:
+                num_labels = math.ceil(int(qty_str) / 400)
+                skus.append({"description": description, "num_labels": num_labels})
+
+    fmt = "pouch" if is_pouch_format else "non-pouch"
     log.info(
-        f"Parsed job ticket: client='{client_name}', PO='{po_number}', "
-        f"{len(skus)} SKUs"
+        f"Parsed job ticket ({fmt} format): client='{client_name}', "
+        f"PO='{po_number}', {len(skus)} SKUs"
     )
     return {
         "client_name": client_name,
@@ -875,4 +897,823 @@ def job_ticket_webhook_handler():
 
     except Exception as exc:
         log.exception(f"Unexpected webhook error: {exc}")
+        return jsonify({"status": "error", "message": str(exc)}), 200
+
+
+# ---------------------------------------------------------------------------
+# Pouch Job Ticket Generation — Proof Approved Webhook
+# Triggered when Proof Status changes to "Proof Approved" (status3__1).
+# Finds the ProForma invoice on the Pricing board via PI#, extracts pouch
+# specs using Claude, fills the Pouch JT PDF template, and uploads it to
+# the Job Ticket column. Non-pouch invoices are silently skipped.
+# ---------------------------------------------------------------------------
+
+PRICING_BOARD_ID = "7035178904"
+PRICING_PI_COLUMN_ID = "text_mksn7xdc"
+PRICING_INVOICE_COLUMN_ID = "file_mknhcwtm"
+PROOF_STATUS_COLUMN_ID = "status3__1"
+
+POUCH_JT_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent
+    / "Job Ticket Templates"
+    / "Pouches Job Ticket_Form_MULTI LOT V12.pdf"
+)
+NONPOUCH_JT_NOAPP_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent
+    / "Job Ticket Templates"
+    / "Non-Pouch JT_NoAPP_Final_April2026.pdf"
+)
+NONPOUCH_JT_WITHAPP_TEMPLATE_PATH = (
+    Path(__file__).resolve().parent
+    / "Job Ticket Templates"
+    / "Non-Pouch_JT_WITH_Application April2026.pdf"
+)
+
+# Row letters used in the Pouch JT form (order = fill order)
+# Rows A–O: DETAIL field has DOUBLE SPACE ("DETAIL  SKU{row}")
+# Rows P+:  DETAIL field has SINGLE SPACE ("DETAIL SKU{row}")
+_JT_ROWS_AO = list("ABCDEFGHIJKLMNO")
+_JT_ROWS_P_PLUS = (
+    list("PQRSTUVWXYZ")
+    + ["AA", "BB", "CC", "DD", "EE", "FF", "GG", "HH", "II", "JJ",
+       "KK", "LL", "MM", "NN", "OO", "PP", "QQ", "RR"]
+)
+_JT_ALL_ROWS = _JT_ROWS_AO + _JT_ROWS_P_PLUS
+
+
+def _format_initials_from_text(people_text: str) -> str:
+    """
+    Convert a people column's text value (e.g. 'John Doe, Jane Smith') to
+    slash-separated initials ('JD/JS').
+    """
+    if not people_text:
+        return ""
+    parts = []
+    for name in re.split(r"[,;&]", people_text):
+        name = name.strip()
+        if name:
+            parts.append("".join(w[0].upper() for w in name.split() if w))
+    return "/".join(parts)
+
+
+def _get_item_data_for_jt(item_id: int) -> dict:
+    """
+    Fetch header data and subitems from the Monday item for Job Ticket filling.
+
+    Returns:
+        {
+            "customer": str,
+            "sram_initials": str,
+            "order_date": str,
+            "pi_number": str,
+            "customer_po": str,
+            "subitems": [{"name": str, "qty": str}, ...]
+        }
+    """
+    # Fetch board columns (for title lookup) alongside item column_values.
+    # Monday API v2024-01 does not expose `title` on ColumnValue — we join via board.columns.
+    # People column `text` = comma-separated names (e.g. "John Doe, Jane Smith").
+    query = """
+    query GetItemForJT($itemId: ID!) {
+      items(ids: [$itemId]) {
+        id
+        name
+        board {
+          columns {
+            id
+            title
+            type
+          }
+        }
+        column_values {
+          id
+          type
+          text
+          value
+        }
+        subitems {
+          id
+          name
+          board {
+            columns {
+              id
+              title
+            }
+          }
+          column_values {
+            id
+            type
+            text
+            value
+          }
+        }
+      }
+    }
+    """
+    data = monday_request(query, {"itemId": str(item_id)})
+    items = data.get("data", {}).get("items", [])
+    if not items:
+        raise RuntimeError(f"Item {item_id} not found")
+
+    item = items[0]
+
+    # title map: column_id → title (from parent board)
+    board_col_titles = {
+        col["id"]: col["title"].strip()
+        for col in item.get("board", {}).get("columns", [])
+    }
+
+    col_by_title: dict = {}  # title.lower() → column_value
+    col_by_id: dict = {}
+
+    for cv in item.get("column_values", []):
+        cid = cv.get("id", "")
+        col_by_id[cid] = cv
+        title = board_col_titles.get(cid, "").lower()
+        if title:
+            col_by_title[title] = cv
+
+    def get_text(*titles):
+        for t in titles:
+            cv = col_by_title.get(t.lower(), {})
+            v = (cv.get("text") or "").strip()
+            if v:
+                return v
+        return ""
+
+    # "Client" is a mirror column on this board; text = client name
+    customer = get_text("client", "customer", "customer name", "company")
+
+    # SR and AM are separate people columns; combine initials (e.g. "JD/JS")
+    sr_text = get_text("sr")
+    am_text = get_text("am")
+    sram_initials = "/".join(
+        filter(None, [_format_initials_from_text(sr_text), _format_initials_from_text(am_text)])
+    )
+
+    order_date = get_text("order date", "date")
+
+    # PI# — prefer known column ID, fall back to title match
+    pi_cv = col_by_id.get("text_mksn14en", {})
+    pi_number = (pi_cv.get("text") or "").strip() or get_text("pi #", "pi#", "pi", "pi number")
+
+    # Column title is "PO#" on this board
+    customer_po = get_text("po#", "customer po", "customer po#", "po number", "purchase order")
+
+    # Subitems → name + order quantity
+    subitems = []
+    for si in item.get("subitems", []):
+        si_name = (si.get("name") or "").strip()
+
+        # Build subitem column title map from its own board
+        si_col_titles = {
+            col["id"]: col["title"].strip().lower()
+            for col in si.get("board", {}).get("columns", [])
+        }
+
+        qty = ""
+        for cv in si.get("column_values", []):
+            t = si_col_titles.get(cv.get("id", ""), "")
+            text_val = (cv.get("text") or "").strip()
+            if any(kw in t for kw in ("qty", "quantity", "order", "units")) and text_val:
+                qty = text_val
+                break
+
+        # Fallback: first column with a pure numeric value
+        if not qty:
+            for cv in si.get("column_values", []):
+                text_val = (cv.get("text") or "").strip()
+                if text_val and text_val.replace(",", "").isdigit():
+                    qty = text_val
+                    break
+
+        subitems.append({"name": si_name, "qty": qty})
+
+    log.info(
+        f"[jt-data] item={item_id} customer='{customer}' PI#='{pi_number}' "
+        f"subitems={len(subitems)}"
+    )
+    return {
+        "customer": customer,
+        "sram_initials": sram_initials,
+        "order_date": order_date,
+        "pi_number": pi_number,
+        "customer_po": customer_po,
+        "subitems": subitems,
+    }
+
+
+def _find_invoice_on_pricing_board(pi_number: str) -> tuple:
+    """
+    Search the Pricing board for an item whose PI# column matches pi_number.
+    Returns (url, filename, customer_name) of the most recent invoice file attached.
+    customer_name comes from the "Client" dropdown column on the Pricing board.
+    """
+    query = """
+    query FindInvoice($boardId: ID!, $columnId: String!, $value: String!) {
+      items_page_by_column_values(
+        limit: 5
+        board_id: $boardId
+        columns: [{ column_id: $columnId, column_values: [$value] }]
+      ) {
+        items {
+          id
+          name
+          column_values(ids: ["file_mknhcwtm", "dropdown_mks82t5z"]) {
+            id
+            text
+            ... on FileValue {
+              files {
+                ... on FileAssetValue {
+                  asset { public_url name }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+    data = monday_request(query, {
+        "boardId": PRICING_BOARD_ID,
+        "columnId": PRICING_PI_COLUMN_ID,
+        "value": str(pi_number),
+    })
+    items = (
+        data.get("data", {})
+        .get("items_page_by_column_values", {})
+        .get("items", [])
+    )
+    if not items:
+        raise RuntimeError(f"No item found on Pricing board for PI# '{pi_number}'")
+
+    item = items[0]
+    col_values = item.get("column_values", [])
+
+    # Separate invoice file and client name columns
+    invoice_cv = next((cv for cv in col_values if cv.get("id") == "file_mknhcwtm"), {})
+    client_cv = next((cv for cv in col_values if cv.get("id") == "dropdown_mks82t5z"), {})
+
+    customer_name = (client_cv.get("text") or "").strip()
+
+    files = invoice_cv.get("files", [])
+    if not files:
+        raise RuntimeError(f"No invoice file attached for PI# '{pi_number}'")
+
+    latest = files[-1].get("asset", {})
+    url = latest.get("public_url")
+    name = latest.get("name", "invoice.pdf")
+    if not url:
+        raise RuntimeError(f"Could not get download URL for invoice PI# '{pi_number}'")
+    return url, name, customer_name
+
+
+def _extract_invoice_text(pdf_path) -> str:
+    """Extract all text from an invoice PDF using pdfplumber."""
+    parts = []
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            text = (page.extract_text() or "").strip()
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _extract_pouch_specs(invoice_text: str) -> list:
+    """
+    Call Claude API to extract all pouch line items from the invoice.
+
+    Returns a list of spec dicts — one per distinct "Pouches:" line item.
+    Returns an empty list if the invoice contains no pouch products.
+    Each dict has all spec fields as strings ("" if not found on the invoice).
+    """
+    import anthropic as _ant
+
+    api_key = (
+        os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("Anthropic_API_Key")
+        or ""
+    ).strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
+
+    client = _ant.Anthropic(api_key=api_key)
+
+    prompt = (
+        "You are a packaging production assistant extracting job specifications "
+        "from a ProForma invoice.\n\n"
+        "TASK: Find every distinct pouch/bag product line item (lines starting with "
+        "\"Pouches:\") and extract its specs. Each sizing variant is a SEPARATE item.\n\n"
+        "Pouch products: stand-up pouches, flat pouches, mylar bags, resealable bags, etc.\n"
+        "Skip non-pouch lines (fees, shipping, labels, boxes, services).\n\n"
+        "For EACH pouch line item, extract:\n\n"
+        "TEXT FIELDS (exact text from invoice, or \"\" if not found):\n"
+        "- sku: Most descriptive product name for this size variant "
+        "(e.g. 'Summit\\'s Peak Domestic Pouches - 1/4 OZ Sizing')\n"
+        "- pouch_type: Type of pouch (e.g. \"Custom Pouch\", \"Stand-Up Pouch\")\n"
+        "- width: Width in inches, number only (e.g. \"6\")\n"
+        "- height: Height in inches, number only (e.g. \"4.5\")\n"
+        "- gusset: Gusset depth in inches, number only, or \"\" if none\n"
+        "- pms_swatch: Pantone/PMS color (e.g. \"PMS 123 C\"), or \"\" if none\n"
+        "- details: Any spec notes not captured in the fields above, or \"\"\n\n"
+        "DROPDOWN FIELDS — match EXACTLY to one of the options, or \"\" if unclear:\n"
+        "- premium_white: NONE | 1 HIT | 2 HIT\n"
+        "- substrate: MET PET | PCR MET PET | WHITE MET PET | CLEAR PET | OTHER *\n"
+        "- color: CMYK | CMY | CMYK + WHITE | CMY + WHITE | K ONLY\n"
+        "- lamination: GLOSS | MATTE | SOFT TOUCH | HOLOGRAPHIC | OTHER *\n"
+        "- zipper: CR ZIPPER (24MM) | NON - CR ZIPPER (10MM) | NO ZIPPER\n"
+        "- hang_hole: NONE | CIRCLE (8MM) | SOMBERO\n"
+        "- tear_notches: YES | NO\n"
+        "- seal_type: K WITH SKIRT | K WITHOUT SKIRT | 3SS\n"
+        "- corner: SQUARE | 0.25\" ROUND CORNER\n\n"
+        "SUBSTRATE MAPPING: METPET → MET PET\n"
+        "ZIPPER MAPPING: Freshlock CR (24mm) → CR ZIPPER (24MM)\n"
+        "CORNER MAPPING: Rounded → 0.25\" ROUND CORNER\n"
+        "COLOR MAPPING: CMYK + White → CMYK + WHITE\n"
+        "LAMINATION MAPPING: Matte Laminate → MATTE\n"
+        "SEAL MAPPING: K-Seal With Skirt → K WITH SKIRT\n\n"
+        f"INVOICE TEXT:\n{invoice_text[:8000]}\n\n"
+        "Respond with ONLY a valid JSON array (no markdown, no extra text). "
+        "One object per pouch line item. Return [] if no pouch products found.\n"
+        '[{"sku": "", "pouch_type": "", "width": "", "height": "", "gusset": "", '
+        '"pms_swatch": "", "details": "", "premium_white": "", "substrate": "", '
+        '"color": "", "lamination": "", "zipper": "", "hang_hole": "", '
+        '"tear_notches": "", "seal_type": "", "corner": ""}]'
+    )
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = message.content[0].text.strip()
+    # Match a JSON array
+    json_match = re.search(r"\[.*\]", response_text, re.DOTALL)
+    if not json_match:
+        raise RuntimeError(f"Claude returned unexpected response: {response_text[:300]}")
+
+    specs_list = json.loads(json_match.group())
+    if not isinstance(specs_list, list):
+        raise RuntimeError(f"Claude returned non-list JSON: {response_text[:300]}")
+
+    log.info(f"[claude] extracted {len(specs_list)} pouch line item(s)")
+    for i, s in enumerate(specs_list, 1):
+        log.info(
+            f"  [{i}] sku='{s.get('sku')}' size={s.get('width')}x"
+            f"{s.get('height')}x{s.get('gusset')} substrate='{s.get('substrate')}'"
+        )
+    return specs_list
+
+
+def _extract_nonpouch_specs(invoice_text: str) -> dict | None:
+    """
+    Call Claude API to extract non-pouch label job specs from the invoice.
+
+    Returns a dict with keys: product_name, size, material_coating, has_application, details
+    Returns None if the invoice does not describe a label job (e.g. it is pouch-only or
+    contains no label line items), so _process_proof_approved can skip silently.
+    """
+    import anthropic as _ant
+
+    api_key = (
+        os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("Anthropic_API_Key")
+        or ""
+    ).strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY environment variable is not set")
+
+    client = _ant.Anthropic(api_key=api_key)
+
+    prompt = (
+        "You are a packaging production assistant extracting job specifications "
+        "from a ProForma invoice for NON-POUCH label products.\n\n"
+        "TASK: Determine whether this invoice contains label products (pressure-sensitive "
+        "labels, shrink sleeves, wrap-around labels, etc.). If it does, extract the specs "
+        "below. If there are no label line items, return null.\n\n"
+        "Extract the following as a JSON object:\n"
+        "- product_name: The descriptive product/SKU name for the label (e.g. 'Custom Labels')\n"
+        "- size: Label dimensions in W x H format with inch marks "
+        "(e.g. '4.6\" x 2.15\"'). Use only the numeric dimensions — do NOT include "
+        "labels like 'W' or 'H'. Always use the inch mark (\") not the word 'inches'.\n"
+        "- material_coating: The material and coating specification found near the bottom "
+        "of the invoice in the job spec / material section "
+        "(e.g. 'BOPP w/ Matte Laminate', 'White BOPP, Gloss OV'). "
+        "Capture the full value including material and any coating/laminate.\n"
+        "- has_application: true if the invoice or job notes mention 'Application', "
+        "'Application Service', or similar applied-label service; otherwise false.\n"
+        "- details: Any additional relevant spec notes not captured above, or \"\"\n\n"
+        "Return ONLY a valid JSON object (no markdown). "
+        "Return the literal value null (not a JSON object) if no label products are present.\n\n"
+        f"INVOICE TEXT:\n{invoice_text[:8000]}"
+    )
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    response_text = message.content[0].text.strip()
+    log.info(f"[claude-nonpouch] raw response: {response_text[:300]}")
+
+    if response_text.lower() in ("null", "none", ""):
+        log.info("[claude-nonpouch] invoice has no label products — skipping")
+        return None
+
+    # Try to extract a JSON object from the response
+    obj_match = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if not obj_match:
+        log.warning(f"[claude-nonpouch] unexpected response (no JSON object): {response_text[:300]}")
+        return None
+
+    specs = json.loads(obj_match.group())
+    if not isinstance(specs, dict):
+        log.warning("[claude-nonpouch] Claude returned non-dict JSON — skipping")
+        return None
+
+    log.info(
+        f"[claude-nonpouch] specs: product='{specs.get('product_name')}' "
+        f"size='{specs.get('size')}' mc='{specs.get('material_coating')}' "
+        f"has_application={specs.get('has_application')}"
+    )
+    return specs
+
+
+def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: list, out_path) -> None:
+    """
+    Fill a Non-Pouch Job Ticket PDF template and save to out_path.
+
+    Page 0 has 14 AcroForm rows (letters A–N) filled via update_page_form_field_values:
+      - DETAIL  SKU{L}  (double-space; row N has a space before N: 'DETAIL  SKU N')
+      - QTY TO PRINT{L} (row N: 'QTY TO PRINT N')
+      - M&C {L}         (always has a space)
+      - FILE NAME{L}    (row N: 'FILE NAME N')
+      - {L}             (just the letter — the item# column)
+
+    Pages 1–3 have P2/P3/P4 overflow rows (72 rows) set via direct annotation scanning:
+      P2 rows 01–14 have _P2 suffix; rows 15–24 don't. P3/P4 rows have no suffix.
+
+    Total capacity: 86 rows.
+    """
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import NameObject, create_string_object
+
+    reader = PdfReader(str(template_path))
+    writer = PdfWriter()
+    writer.append(reader)
+
+    size = (specs.get("size") or "").strip()
+    mc = (specs.get("material_coating") or "").strip()
+
+    # -----------------------------------------------------------------------
+    # Page 0: AcroForm rows A–N (14 rows)
+    # -----------------------------------------------------------------------
+    _PAGE0_LETTERS = list("ABCDEFGHIJKLMN")  # 14 letters
+
+    acroform_fields: dict[str, str] = {}
+    def _a(k, v):
+        if v:
+            acroform_fields[k] = v
+
+    # Header fields
+    _a("CUSTOMER", item_data.get("customer", ""))
+    _a("SRAM", item_data.get("sram_initials", ""))
+    _a("ORDER DATE", item_data.get("order_date", ""))
+    _a("PI", item_data.get("pi_number", ""))
+    _a("CUSTOMER PO", item_data.get("customer_po", ""))
+
+    # Page 0 item rows — fill as many as we have subitems (up to 14)
+    page0_subitems = subitems[: len(_PAGE0_LETTERS)]
+    overflow_subitems = subitems[len(_PAGE0_LETTERS):]
+
+    for i, subitem in enumerate(page0_subitems):
+        L = _PAGE0_LETTERS[i]
+        # Row N has a leading space before the letter in most field names
+        sp = " " if L == "N" else ""
+        item_name = (subitem.get("name") or "").strip()
+        qty = (subitem.get("qty") or "").strip()
+        # Item # column ({L}) = SKU/subitem name
+        _a(L, item_name)
+        # DETAIL  SKU{L} = SIZE column on the non-pouch template
+        _a(f"DETAIL  SKU{sp}{L}", size)
+        _a(f"QTY TO PRINT{sp}{L}", qty)
+        _a(f"M&C {L}", mc)
+        # FILE NAME left blank for team to fill
+
+    for page in writer.pages:
+        writer.update_page_form_field_values(page, acroform_fields)
+
+    # -----------------------------------------------------------------------
+    # Pages 1–3: overflow rows via direct annotation scanning (P2/P3/P4)
+    # -----------------------------------------------------------------------
+    if overflow_subitems:
+        # Build ordered slot list for P2/P3/P4 rows
+        slots: list[tuple[int, int, bool]] = []
+        for r in range(1, 15):    # P2 rows 01–14: have _P2 suffix
+            slots.append((2, r, True))
+        for r in range(15, 25):   # P2 rows 15–24: no suffix
+            slots.append((2, r, False))
+        for r in range(1, 25):    # P3 rows 01–24
+            slots.append((3, r, False))
+        for r in range(1, 25):    # P4 rows 01–24
+            slots.append((4, r, False))
+
+        row_field_values: dict[str, str] = {}
+        for slot_idx, subitem in enumerate(overflow_subitems[: len(slots)]):
+            p, r, has_suffix = slots[slot_idx]
+            sfx = f"_P{p}" if has_suffix else ""
+            rr = f"{r:02d}"
+            row_field_values[f"P{p}_R{rr}_ITEM{sfx}"] = (subitem.get("name") or "").strip()
+            row_field_values[f"P{p}_R{rr}_QTY{sfx}"] = (subitem.get("qty") or "").strip()
+            row_field_values[f"P{p}_R{rr}_SIZE{sfx}"] = size
+            row_field_values[f"P{p}_R{rr}_MC{sfx}"] = mc
+
+        for page in writer.pages:
+            annots_ref = page.get("/Annots")
+            if not annots_ref:
+                continue
+            annots = annots_ref.get_object() if hasattr(annots_ref, "get_object") else annots_ref
+            for ref in annots:
+                try:
+                    annot = ref.get_object()
+                except Exception:
+                    continue
+                field_name = str(annot.get("/T", ""))
+                if field_name not in row_field_values:
+                    continue
+                val = row_field_values[field_name]
+                annot[NameObject("/V")] = create_string_object(val)
+                if NameObject("/AP") in annot:
+                    del annot[NameObject("/AP")]
+
+        log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 fields set")
+
+    with open(str(out_path), "wb") as f:
+        writer.write(f)
+
+    log.info(
+        f"[fill-nonpouch-jt] {len(acroform_fields)} AcroForm fields "
+        f"({len(page0_subitems)} page-0 rows, {len(overflow_subitems)} overflow) → {out_path}"
+    )
+
+
+def _fill_pouch_jt(template_path, item_data: dict, pouch_specs: dict, subitems: list, out_path) -> None:
+    """Fill the Pouch Job Ticket PDF template and save to out_path."""
+    from pypdf import PdfReader, PdfWriter
+
+    reader = PdfReader(str(template_path))
+    writer = PdfWriter()
+    writer.append(reader)
+
+    fields: dict = {}
+
+    # Header
+    _set = lambda k, v: fields.__setitem__(k, v) if v else None
+    _set("CUSTOMER", item_data.get("customer", ""))
+    _set("SRAM", item_data.get("sram_initials", ""))
+    _set("ORDER DATE", item_data.get("order_date", ""))
+    _set("PI", item_data.get("pi_number", ""))
+    _set("CUSTOMER PO", item_data.get("customer_po", ""))
+
+    # Job spec text fields (W/H/G get inch marks appended)
+    for field_name, spec_key in [
+        ("SKU", "sku"),
+        ("POUCH TYPE", "pouch_type"),
+        ("W", "width"),
+        ("H", "height"),
+        ("G", "gusset"),
+        ("PMS SWATCH", "pms_swatch"),
+    ]:
+        val = (pouch_specs.get(spec_key) or "").strip()
+        if field_name in ("W", "H", "G") and val and not val.endswith('"'):
+            val = val + '"'
+        _set(field_name, val)
+
+    # Dropdowns — defaults apply when Claude leaves a field blank
+    _DROPDOWN_DEFAULTS = {
+        "Dropdown6": "NONE",  # hang_hole: if not specified, default to None
+    }
+    for field_name, spec_key in [
+        ("Dropdown1", "premium_white"),
+        ("Dropdown2", "substrate"),
+        ("Dropdown3", "color"),
+        ("Dropdown4", "lamination"),
+        ("Dropdown5", "zipper"),
+        ("Dropdown6", "hang_hole"),
+        ("Dropdown8", "tear_notches"),
+        ("Dropdown9", "seal_type"),
+        ("Dropdown10", "corner"),
+    ]:
+        val = (pouch_specs.get(spec_key) or "").strip()
+        if not val:
+            val = _DROPDOWN_DEFAULTS.get(field_name, "")
+        _set(field_name, val)
+
+    # Details text area
+    _set("DETAILSRow1", (pouch_specs.get("details") or "").strip())
+
+    # Subitem rows — fill QTY and DETAIL SKU; leave ITEM# blank (team fills it)
+    for i, subitem in enumerate(subitems[: len(_JT_ALL_ROWS)]):
+        row = _JT_ALL_ROWS[i]
+        qty = (subitem.get("qty") or "").strip()
+        sku_name = (subitem.get("name") or "").strip()
+        _set(f"QTY TO PRINT{row}", qty)
+        # Rows A–O have DOUBLE SPACE before SKU; P+ have single space
+        detail_key = f"DETAIL  SKU{row}" if row in _JT_ROWS_AO else f"DETAIL SKU{row}"
+        _set(detail_key, sku_name)
+
+    for page in writer.pages:
+        writer.update_page_form_field_values(page, fields)
+
+    # After filling, increase font size for dimension fields and force re-render.
+    # update_page_form_field_values bakes a cached appearance (/AP); deleting it
+    # makes PDF viewers fall back to /DA (Default Appearance) which we set to 12pt.
+    from pypdf.generic import NameObject, create_string_object
+    _DIM_FIELDS = {"W", "H", "G"}
+    for page in writer.pages:
+        annots = page.get("/Annots") or []
+        for ref in annots:
+            try:
+                annot = ref.get_object()
+            except Exception:
+                continue
+            t = str(annot.get("/T", ""))
+            if t not in _DIM_FIELDS:
+                continue
+            da = str(annot.get("/DA", "/Helv 8 Tf 0 g"))
+            new_da = re.sub(r"[\d.]+\s+Tf", "12 Tf", da)
+            if "Tf" not in new_da:
+                new_da = "/Helv 12 Tf 0 g"
+            annot[NameObject("/DA")] = create_string_object(new_da)
+            if NameObject("/AP") in annot:
+                del annot[NameObject("/AP")]
+
+    with open(str(out_path), "wb") as f:
+        writer.write(f)
+
+    log.info(f"[fill-jt] wrote {len(fields)} fields → {out_path}")
+
+
+def _upload_file_to_monday_column(item_id: int, file_path, column_id: str) -> None:
+    """Upload any file to a specified Monday.com file column."""
+    token = get_token()
+    mutation = """
+    mutation AddFile($itemId: ID!, $columnId: String!, $file: File!) {
+      add_file_to_column(item_id: $itemId, column_id: $columnId, file: $file) {
+        id
+      }
+    }
+    """
+    variables = {"itemId": str(item_id), "columnId": column_id}
+    with open(str(file_path), "rb") as f:
+        file_bytes = f.read()
+
+    filename = Path(file_path).name
+    resp = requests.post(
+        MONDAY_FILE_API_URL,
+        headers={"Authorization": token, "API-Version": "2024-01"},
+        files={
+            "query": (None, mutation),
+            "variables": (None, json.dumps(variables)),
+            "map": (None, json.dumps({"file": ["variables.file"]})),
+            "file": (filename, file_bytes, "application/pdf"),
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+    if "errors" in result:
+        raise RuntimeError(f"Upload error: {result['errors']}")
+    log.info(f"[upload] {filename} → column '{column_id}' on item {item_id}")
+
+
+def _process_proof_approved(item_id: int) -> None:
+    """
+    End-to-end handler for Proof Approved trigger:
+      1. Fetch item data (customer, PI#, subitems, …) from Monday
+      2. Find and download ProForma invoice from Pricing board via PI#
+      3. Extract invoice text
+      4a. If pouch line items found → fill Pouch JT template (one per distinct size)
+      4b. Else if label line items found → fill Non-Pouch JT template (NoAPP or WITH_Application)
+      4c. Else → skip silently
+      5. Upload filled PDF(s) to Job Ticket column
+    """
+    with tempfile.TemporaryDirectory() as _tmp:
+        tmp = Path(_tmp)
+
+        log.info(f"[proof-approved] fetching item data for {item_id}")
+        item_data = _get_item_data_for_jt(item_id)
+
+        pi_number = item_data.get("pi_number", "").strip()
+        if not pi_number:
+            log.warning(f"[proof-approved] item {item_id} has no PI# — skipping")
+            return
+
+        log.info(f"[proof-approved] looking up invoice for PI# {pi_number}")
+        invoice_url, invoice_name, pricing_customer = _find_invoice_on_pricing_board(pi_number)
+
+        # Mirror column may be null if board relation isn't connected; fall back to Pricing board
+        if not item_data.get("customer") and pricing_customer:
+            item_data["customer"] = pricing_customer
+            log.info(f"[proof-approved] customer from Pricing board: '{pricing_customer}'")
+
+        invoice_path = tmp / "invoice.pdf"
+        download_file(invoice_url, invoice_path)
+
+        log.info("[proof-approved] extracting invoice text")
+        invoice_text = _extract_invoice_text(invoice_path)
+
+        log.info("[proof-approved] calling Claude for pouch specs")
+        specs_list = _extract_pouch_specs(invoice_text)
+
+        # Build a filesystem-safe base name: "Client Name_PI#_JT"
+        _safe = re.sub(r'[\\/:*?"<>|]', "", item_data.get("customer", "Unknown"))
+        _pi = item_data.get("pi_number", "").strip() or "NoPI"
+        _base = f"{_safe}_{_pi}_JT"
+
+        if specs_list:
+            # --- Pouch job: one JT per distinct sizing line item ---
+            for i, pouch_specs in enumerate(specs_list, 1):
+                suffix = f"_{i}" if len(specs_list) > 1 else ""
+                jt_out = tmp / f"{_base}{suffix}.pdf"
+                log.info(f"[proof-approved] filling pouch JT {i}/{len(specs_list)}: {pouch_specs.get('sku', '')}")
+                _fill_pouch_jt(
+                    POUCH_JT_TEMPLATE_PATH,
+                    item_data,
+                    pouch_specs,
+                    item_data["subitems"],
+                    jt_out,
+                )
+                log.info(f"[proof-approved] uploading pouch JT {i}/{len(specs_list)}")
+                _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+            log.info(f"[proof-approved] done — {len(specs_list)} pouch JT(s) uploaded for item {item_id}")
+        else:
+            # --- Not a pouch job — try non-pouch label template ---
+            log.info("[proof-approved] no pouch specs found; checking for non-pouch label job")
+            nonpouch_specs = _extract_nonpouch_specs(invoice_text)
+
+            if nonpouch_specs is None:
+                log.info(f"[proof-approved] item {item_id} is not a pouch or label job — skipping")
+                return
+
+            has_app = nonpouch_specs.get("has_application", False)
+            template = NONPOUCH_JT_WITHAPP_TEMPLATE_PATH if has_app else NONPOUCH_JT_NOAPP_TEMPLATE_PATH
+            log.info(
+                f"[proof-approved] non-pouch label job — "
+                f"{'WITH' if has_app else 'No'} Application template"
+            )
+
+            jt_out = tmp / f"{_base}.pdf"
+            _fill_nonpouch_jt(
+                template,
+                item_data,
+                nonpouch_specs,
+                item_data["subitems"],
+                jt_out,
+            )
+            log.info("[proof-approved] uploading non-pouch JT")
+            _upload_file_to_monday_column(item_id, jt_out, JOB_TICKET_COLUMN_ID)
+            log.info(f"[proof-approved] done — non-pouch JT uploaded for item {item_id}")
+
+
+@app.route("/webhook/proof-approved", methods=["GET"])
+def proof_approved_webhook_verify():
+    challenge = request.args.get("challenge")
+    if challenge:
+        return jsonify({"challenge": challenge})
+    return "OK", 200
+
+
+@app.route("/webhook/proof-approved", methods=["POST"])
+def proof_approved_webhook_handler():
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+
+        if "challenge" in body:
+            return jsonify({"challenge": body["challenge"]})
+
+        event = body.get("event", body)
+        item_id = event.get("pulseId") or event.get("itemId") or event.get("item_id")
+        column_id = event.get("columnId") or event.get("column_id")
+
+        log.info(f"[proof-approved] webhook — item={item_id} column={column_id}")
+
+        if not item_id:
+            return jsonify({"status": "ignored", "reason": "no item_id"}), 200
+
+        if column_id and column_id != PROOF_STATUS_COLUMN_ID:
+            return jsonify({"status": "ignored", "reason": "wrong column"}), 200
+
+        try:
+            _process_proof_approved(int(item_id))
+        except Exception as exc:
+            log.exception(f"[proof-approved] error for item {item_id}: {exc}")
+            return jsonify({"status": "error", "message": str(exc)}), 200
+
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as exc:
+        log.exception(f"[proof-approved] unexpected error: {exc}")
         return jsonify({"status": "error", "message": str(exc)}), 200

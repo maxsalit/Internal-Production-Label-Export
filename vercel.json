@@ -1,1 +1,7 @@
-   {}
+{
+  "functions": {
+    "api/webhook_proof_approved.py": {
+      "maxDuration": 60
+    }
+  }
+}
