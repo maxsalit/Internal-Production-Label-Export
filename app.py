@@ -1575,7 +1575,7 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
                 except Exception:
                     continue
                 field_name = str(annot.get("/T", ""))
-                if "_ITEM" in field_name and field_name in row_field_values:
+                if field_name in row_field_values:
                     annot[NameObject("/Ff")] = _ff_multiline
 
         log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 rows")
