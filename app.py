@@ -1535,14 +1535,11 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
         _a(f"M&C {L}", mc)
         # FILE NAME left blank for team to fill
 
-    for page in writer.pages:
-        writer.update_page_form_field_values(page, acroform_fields)
-
     # -----------------------------------------------------------------------
-    # Pages 1–3: overflow rows via direct annotation scanning (P2/P3/P4)
+    # Pages 1–3: overflow rows (P2/P3/P4)
     # -----------------------------------------------------------------------
+    row_field_values: dict[str, str] = {}
     if overflow_subitems:
-        # Build ordered slot list for P2/P3/P4 rows
         slots: list[tuple[int, int, bool]] = []
         for r in range(1, 15):    # P2 rows 01–14: have _P2 suffix
             slots.append((2, r, True))
@@ -1553,7 +1550,6 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
         for r in range(1, 25):    # P4 rows 01–24
             slots.append((4, r, False))
 
-        row_field_values: dict[str, str] = {}
         for slot_idx, subitem in enumerate(overflow_subitems[: len(slots)]):
             p, r, has_suffix = slots[slot_idx]
             sfx = f"_P{p}" if has_suffix else ""
@@ -1563,13 +1559,10 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
             row_field_values[f"P{p}_R{rr}_SIZE{sfx}"] = size
             row_field_values[f"P{p}_R{rr}_MC{sfx}"] = mc
 
-        # Set a fixed /DA on overflow annotations so the viewer renders them at
-        # a consistent 8pt rather than using the inherited Auto (0 Tf) which
-        # makes short values like "750" fill the entire row height.
-        # Also set Ff=4096 (multiline) on ITEM fields so long names wrap instead
-        # of being clipped (page-1 fields already have Ff=4096 in the template).
+        # Pre-set Ff=4096 (multiline) on overflow ITEM annotations so pypdf
+        # generates wrapping appearances — matching how page-1 fields behave.
+        # Page-1 fields already have Ff=4096 in the template; overflow fields don't.
         from pypdf.generic import NumberObject
-        _da_fixed = create_string_object("/Helv 8 Tf 0 g")
         _ff_multiline = NumberObject(4096)
         for page in writer.pages:
             annots_ref = page.get("/Annots")
@@ -1582,27 +1575,16 @@ def _fill_nonpouch_jt(template_path, item_data: dict, specs: dict, subitems: lis
                 except Exception:
                     continue
                 field_name = str(annot.get("/T", ""))
-                if field_name not in row_field_values:
-                    continue
-                val = row_field_values[field_name]
-                annot[NameObject("/V")] = create_string_object(val)
-                annot[NameObject("/DA")] = _da_fixed
-                # ITEM fields: enable multiline so long names wrap
-                if "_ITEM" in field_name:
+                if "_ITEM" in field_name and field_name in row_field_values:
                     annot[NameObject("/Ff")] = _ff_multiline
-                if NameObject("/AP") in annot:
-                    del annot[NameObject("/AP")]
 
-        log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 fields set")
+        log.info(f"[fill-nonpouch-jt] overflow: {len(row_field_values)} P2/P3/P4 rows")
 
-    try:
-        from pypdf.generic import BooleanObject
-        acroform = writer._root_object.get("/AcroForm")
-        if acroform is not None:
-            acroform_obj = acroform.get_object() if hasattr(acroform, "get_object") else acroform
-            acroform_obj[NameObject("/NeedAppearances")] = BooleanObject(True)
-    except Exception as e:
-        log.warning(f"[fill-nonpouch-jt] could not set /NeedAppearances: {e}")
+    # Fill ALL fields (page-1 + overflow) with update_page_form_field_values so
+    # pypdf generates consistent /AP streams for every page uniformly.
+    all_fields = {**acroform_fields, **row_field_values}
+    for page in writer.pages:
+        writer.update_page_form_field_values(page, all_fields)
 
     with open(str(out_path), "wb") as f:
         writer.write(f)
